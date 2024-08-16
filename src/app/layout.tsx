@@ -8,8 +8,10 @@ export const metadata: Metadata = {
   title: "Leaflet Map Divider",
   description: "Tile your image to various zoom levels. Perfect for LeafletJS",
   alternates: {
-    canonical: "https://leafletmapdivider",
+    canonical: "https://leafletmapdivider.com",
   },
+  keywords:
+    "map, tiler, maptiler, divide, fantasy map, custom, tilelayer, leafletjs, leaflet, react-leaflet",
 };
 
 export default function RootLayout({
