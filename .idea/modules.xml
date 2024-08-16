@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/maptiler.iml" filepath="$PROJECT_DIR$/.idea/maptiler.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/leafletmapdivider.iml" filepath="$PROJECT_DIR$/.idea/leafletmapdivider.iml" />
     </modules>
   </component>
 </project>
