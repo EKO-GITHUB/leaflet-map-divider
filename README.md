@@ -1,4 +1,4 @@
-# Leaflet Map Divider
+# https://leafletmapdivider.com
 
 Divides your large map into a LeafletJS compatible TileLayer!
 
