@@ -115,8 +115,8 @@ export default function Home() {
     const ctx = canvas.getContext("2d");
 
     for (
-      let zoom_level_curr = 1;
-      zoom_level_curr <= zoom_level_display;
+      let zoom_level_curr = 0;
+      zoom_level_curr < zoom_level_display;
       zoom_level_curr++
     ) {
       setCurrent_zoom_level(zoom_level_curr);
@@ -184,7 +184,7 @@ export default function Home() {
       let new_width: number;
       let new_height: number;
 
-      if (zoom_level == 1) {
+      if (zoom_level == 0) {
         new_width = tile_width_display;
         new_height = tile_height_display;
         canvas.width = new_width;
