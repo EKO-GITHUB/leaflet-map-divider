@@ -199,7 +199,7 @@ export default function Home() {
       ctx!.drawImage(image, 0, 0, new_width, new_height);
 
       const resizedImage = new Image();
-      resizedImage.src = canvas.toDataURL();
+      resizedImage.src = canvas.toDataURL("image/png", 1);
       resizedImage.onload = () =>
         resolve({
           image: resizedImage,
