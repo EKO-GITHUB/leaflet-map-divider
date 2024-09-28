@@ -165,7 +165,7 @@ export default function Home() {
       zip.generateAsync({ type: "blob" }).then((content) => {
         const a = document.createElement("a");
         a.href = URL.createObjectURL(content);
-        a.download = "tiled_map.zip";
+        a.download = `${file_name?.replaceAll(".png", "").replaceAll(".jpg", "").replaceAll(".webp", "").replaceAll(".jpeg", "")}.zip`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
