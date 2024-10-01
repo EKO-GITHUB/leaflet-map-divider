@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import JSZip from "jszip";
 import Link from "next/link";
+import { Switch } from "@/components/ui/switch";
 
 type New_Image = {
   image: HTMLImageElement;
@@ -33,6 +34,7 @@ export default function Home() {
   let [download_disabled, setDownloadDisabled] = useState<boolean>(false);
   let [progress, setProgress] = useState<number>(0);
   let [current_zoom_level, setCurrent_zoom_level] = useState<number>(0);
+  let [output_format, setOutput_format] = useState<string | null>("png");
   let [zip, setZip] = useState<JSZip | null>(null);
   let zoom_level = 0;
   let tile_width = 0;
@@ -147,14 +149,20 @@ export default function Home() {
             tile_height_display,
           );
 
-          const dataURL = canvas.toDataURL("image/png");
+          const dataURL = canvas.toDataURL(
+            output_format == "png" ? "image/png" : "image/webp",
+          );
           const base64Data = dataURL.replace(
-            /^data:image\/(png|jpg);base64,/,
+            /^data:image\/(png|jpg|webp);base64,/,
             "",
           );
-          zip.file(`${zoom_level_curr}/${y}/${x}.png`, base64Data, {
-            base64: true,
-          });
+          zip.file(
+            `${zoom_level_curr}/${y}/${x}.${output_format == "png" ? "png" : "webp"}`,
+            base64Data,
+            {
+              base64: true,
+            },
+          );
         }
         setProgress(Math.floor((x / tilesX) * 100));
       }
@@ -362,6 +370,24 @@ export default function Home() {
         )}
         {chosen_image != null && (
           <>
+            <div
+              className={
+                "flex gap-4 justify-center items-center justify-items-center"
+              }
+            >
+              Output Format:
+              <div className={"flex justify-center gap-2"}>
+                {".png"}
+                <Switch
+                  onCheckedChange={(checked) => {
+                    !checked
+                      ? setOutput_format("png")
+                      : setOutput_format("webp");
+                  }}
+                />
+                {".webp"}
+              </div>
+            </div>
             <Button
               variant={"secondary"}
               disabled={download_disabled}
