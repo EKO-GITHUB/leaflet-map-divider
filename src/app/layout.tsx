@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import "./globals.css";
+import { Analytics } from "@vercel/analytics/next";
 
 const inter = Inter({ subsets: ["latin"] });
 
@@ -10,8 +11,7 @@ export const metadata: Metadata = {
   alternates: {
     canonical: "https://leafletmapdivider.com"
   },
-  keywords:
-    "map, tiler, maptiler, divide, fantasy map, custom, tilelayer, leafletjs, leaflet, react-leaflet"
+  keywords: "map, tiler, maptiler, divide, fantasy map, custom, tilelayer, leafletjs, leaflet, react-leaflet"
 };
 
 export default function RootLayout({
@@ -19,9 +19,7 @@ export default function RootLayout({
                                    }: Readonly<{
   children: React.ReactNode;
 }>) {
-  return (
-    <html lang="en">
-    <body className={inter.className}>{children}</body>
-    </html>
-  );
+  return (<html lang="en">
+  <body className={inter.className}>{children} <Analytics /></body>
+  </html>);
 }
