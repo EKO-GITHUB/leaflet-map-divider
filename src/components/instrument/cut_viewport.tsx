@@ -125,6 +125,17 @@ export function CutViewport({
     set_is_expanded(false);
   }, [zoom, image, is_generating]);
 
+  // hold the decoded full-resolution bitmap only while a tile view is open
+  useEffect(() => {
+    if (!inspected_cell) {
+      release_full_bitmap();
+    }
+  }, [inspected_cell]);
+
+  useEffect(() => {
+    return () => release_full_bitmap();
+  }, [image]);
+
   useEffect(() => {
     return () => {
       if (close_timer.current !== null) {
@@ -215,28 +226,38 @@ export function CutViewport({
     if (proxy) {
       paint(proxy.canvas, proxy.canvas.width);
       if (proxy.is_full_res) return;
+    } else {
+      ctx.fillStyle = "#070a0f";
+      ctx.fillRect(0, 0, size, size);
     }
 
-    const full = image.element.naturalWidth;
-    const src_tile = full / n;
-    createImageBitmap(
-      image.element,
-      Math.round(inspected_cell.x * src_tile),
-      Math.round(inspected_cell.y * src_tile),
-      Math.round(src_tile),
-      Math.round(src_tile)
-    )
+    if (full_bitmap_ref.current) {
+      paint(full_bitmap_ref.current, full_bitmap_ref.current.width);
+      return;
+    }
+
+    // decode from the blob: Chromium decodes blob sources off the main thread,
+    // while element sources decode on it and stall the animation
+    if (!full_promise_ref.current) {
+      full_promise_ref.current = fetch(image.src)
+        .then((response) => response.blob())
+        .then((blob) => createImageBitmap(blob));
+    }
+    const my_promise = full_promise_ref.current;
+    my_promise
       .then((bitmap) => {
-        if (draw_token.current === token && canvas_ref.current) {
-          ctx.fillStyle = "#070a0f";
-          ctx.fillRect(0, 0, size, size);
-          ctx.drawImage(bitmap, 0, 0, size, size);
+        if (full_promise_ref.current !== my_promise) {
+          bitmap.close();
+          return;
         }
-        bitmap.close();
+        full_bitmap_ref.current = bitmap;
+        if (draw_token.current === token && canvas_ref.current) {
+          paint(bitmap, bitmap.width);
+        }
       })
       .catch(() => {
-        if (draw_token.current === token && canvas_ref.current) {
-          paint(image.element, full);
+        if (full_promise_ref.current === my_promise) {
+          full_promise_ref.current = null;
         }
       });
   }, [inspected_cell, image, n]);
