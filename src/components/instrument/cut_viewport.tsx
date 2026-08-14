@@ -93,7 +93,22 @@ export function CutViewport({
   const [is_dragging, set_is_dragging] = useState(false);
   const [hover_cell, set_hover_cell] = useState<{ x: number; y: number } | null>(null);
   const [inspected_cell, set_inspected_cell] = useState<{ x: number; y: number } | null>(null);
+  const [is_expanded, set_is_expanded] = useState(false);
   const section_ref = useRef<HTMLElement>(null);
+  const frame_ref = useRef<HTMLDivElement>(null);
+  const canvas_ref = useRef<HTMLCanvasElement>(null);
+  const close_timer = useRef<number | null>(null);
+  const was_open = useRef(false);
+  const proxy_ref = useRef<{ canvas: HTMLCanvasElement; is_full_res: boolean } | null>(null);
+  const draw_token = useRef(0);
+  const full_bitmap_ref = useRef<ImageBitmap | null>(null);
+  const full_promise_ref = useRef<Promise<ImageBitmap> | null>(null);
+
+  const release_full_bitmap = () => {
+    full_bitmap_ref.current?.close();
+    full_bitmap_ref.current = null;
+    full_promise_ref.current = null;
+  };
 
   const displayed_zoom = is_generating ? progress.current_zoom_level : zoom;
   const n = Math.pow(2, displayed_zoom);
@@ -102,8 +117,183 @@ export function CutViewport({
   const filled = is_generating && zoom_row ? zoom_row.processed_tiles_in_level : 0;
 
   useEffect(() => {
+    if (close_timer.current !== null) {
+      window.clearTimeout(close_timer.current);
+      close_timer.current = null;
+    }
     set_inspected_cell(null);
+    set_is_expanded(false);
   }, [zoom, image, is_generating]);
+
+  useEffect(() => {
+    return () => {
+      if (close_timer.current !== null) {
+        window.clearTimeout(close_timer.current);
+      }
+    };
+  }, []);
+
+  // decode the source once into a small proxy, off the interaction path, so
+  // opening a tile never has to re-decode the full-resolution image
+  useEffect(() => {
+    proxy_ref.current = null;
+    if (!image) return;
+    let cancelled = false;
+
+    const build = async () => {
+      const size = Math.min(2048, image.element.naturalWidth);
+      const canvas = document.createElement("canvas");
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      try {
+        const bitmap = await createImageBitmap(image.element, {
+          resizeWidth: size,
+          resizeHeight: size,
+          resizeQuality: "high"
+        });
+        if (cancelled) {
+          bitmap.close();
+          return;
+        }
+        ctx.drawImage(bitmap, 0, 0);
+        bitmap.close();
+      } catch {
+        ctx.drawImage(image.element, 0, 0, size, size);
+      }
+      if (!cancelled) {
+        proxy_ref.current = { canvas, is_full_res: size === image.element.naturalWidth };
+      }
+    };
+
+    build();
+    return () => {
+      cancelled = true;
+    };
+  }, [image]);
+
+  // draw the inspected tile into the overlay canvas: instantly from the proxy,
+  // then refined from the full-resolution source decoded off the main thread.
+  // The canvas is opaque and painted with the app background first so tiles
+  // with transparency show the viewport ground, not the image underneath.
+  useEffect(() => {
+    if (!inspected_cell || !image) return;
+    const canvas = canvas_ref.current;
+    const frame = frame_ref.current;
+    if (!canvas || !frame) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const size = Math.max(1, Math.round(frame.clientWidth * dpr));
+    if (canvas.width !== size || canvas.height !== size) {
+      canvas.width = size;
+      canvas.height = size;
+    }
+    const ctx = canvas.getContext("2d", { alpha: false });
+    if (!ctx) return;
+    ctx.imageSmoothingEnabled = false;
+    const token = ++draw_token.current;
+
+    const paint = (source: CanvasImageSource, source_size: number) => {
+      const src_tile = source_size / n;
+      ctx.fillStyle = "#070a0f";
+      ctx.fillRect(0, 0, size, size);
+      ctx.drawImage(
+        source,
+        Math.round(inspected_cell.x * src_tile),
+        Math.round(inspected_cell.y * src_tile),
+        Math.round(src_tile),
+        Math.round(src_tile),
+        0,
+        0,
+        size,
+        size
+      );
+    };
+
+    const proxy = proxy_ref.current;
+    if (proxy) {
+      paint(proxy.canvas, proxy.canvas.width);
+      if (proxy.is_full_res) return;
+    }
+
+    const full = image.element.naturalWidth;
+    const src_tile = full / n;
+    createImageBitmap(
+      image.element,
+      Math.round(inspected_cell.x * src_tile),
+      Math.round(inspected_cell.y * src_tile),
+      Math.round(src_tile),
+      Math.round(src_tile)
+    )
+      .then((bitmap) => {
+        if (draw_token.current === token && canvas_ref.current) {
+          ctx.fillStyle = "#070a0f";
+          ctx.fillRect(0, 0, size, size);
+          ctx.drawImage(bitmap, 0, 0, size, size);
+        }
+        bitmap.close();
+      })
+      .catch(() => {
+        if (draw_token.current === token && canvas_ref.current) {
+          paint(image.element, full);
+        }
+      });
+  }, [inspected_cell, image, n]);
+
+  // expand on the frame after the collapsed canvas is committed, so the transition runs
+  useEffect(() => {
+    if (inspected_cell && !was_open.current) {
+      was_open.current = true;
+      const id = requestAnimationFrame(() => set_is_expanded(true));
+      return () => cancelAnimationFrame(id);
+    }
+    if (!inspected_cell) {
+      was_open.current = false;
+    }
+  }, [inspected_cell]);
+
+  const close_tile = () => {
+    if (close_timer.current !== null) return;
+    set_is_expanded(false);
+    close_timer.current = window.setTimeout(() => {
+      set_inspected_cell(null);
+      close_timer.current = null;
+    }, 380);
+  };
+
+  const move_inspected = (dx: number, dy: number) => {
+    if (close_timer.current !== null) return;
+    set_inspected_cell((cell) => {
+      if (!cell) return cell;
+      const x = cell.x + dx;
+      const y = cell.y + dy;
+      if (x < 0 || y < 0 || x >= n || y >= n) return cell;
+      return { x, y };
+    });
+  };
+
+  useEffect(() => {
+    if (!inspected_cell || is_generating) return;
+
+    const handle_key = (e: KeyboardEvent) => {
+      const moves: Record<string, [number, number]> = {
+        ArrowLeft: [-1, 0],
+        ArrowRight: [1, 0],
+        ArrowUp: [0, -1],
+        ArrowDown: [0, 1]
+      };
+      if (moves[e.key]) {
+        e.preventDefault();
+        move_inspected(...moves[e.key]);
+      } else if (e.key === "Escape") {
+        close_tile();
+      }
+    };
+
+    window.addEventListener("keydown", handle_key);
+    return () => window.removeEventListener("keydown", handle_key);
+  }, [!!inspected_cell, is_generating, n]);
 
   useEffect(() => {
     const section = section_ref.current;
@@ -131,7 +321,7 @@ export function CutViewport({
   const handle_cell_click = () => {
     if (is_generating) return;
     if (inspected_cell) {
-      set_inspected_cell(null);
+      close_tile();
       return;
     }
     if (hover_cell && n > 1) {
@@ -139,37 +329,7 @@ export function CutViewport({
     }
   };
 
-  const move_inspected = (dx: number, dy: number) => {
-    set_inspected_cell((cell) => {
-      if (!cell) return cell;
-      const x = cell.x + dx;
-      const y = cell.y + dy;
-      if (x < 0 || y < 0 || x >= n || y >= n) return cell;
-      return { x, y };
-    });
-  };
-
-  useEffect(() => {
-    if (!inspected_cell || is_generating) return;
-
-    const handle_key = (e: KeyboardEvent) => {
-      const moves: Record<string, [number, number]> = {
-        ArrowLeft: [-1, 0],
-        ArrowRight: [1, 0],
-        ArrowUp: [0, -1],
-        ArrowDown: [0, 1]
-      };
-      if (moves[e.key]) {
-        e.preventDefault();
-        move_inspected(...moves[e.key]);
-      } else if (e.key === "Escape") {
-        set_inspected_cell(null);
-      }
-    };
-
-    window.addEventListener("keydown", handle_key);
-    return () => window.removeEventListener("keydown", handle_key);
-  }, [!!inspected_cell, is_generating, n]);
+  const show_tile_view = !!inspected_cell && is_expanded;
 
   return (
     <section
@@ -222,8 +382,9 @@ export function CutViewport({
       {image ? (
         <>
           <div
+            ref={frame_ref}
             className={`relative z-10 aspect-square overflow-hidden border shadow-[0_0_80px_rgba(0,0,0,0.7)] transition-colors duration-300 ${
-              inspected_cell ? "border-[var(--c-acc)]" : "border-transparent"
+              show_tile_view ? "border-[var(--c-acc)]" : "border-transparent"
             }`}
             style={{
               width: "min(72vmin, 100%)",
@@ -244,24 +405,30 @@ export function CutViewport({
               alt={`Cut preview of ${image.file_name}`}
               className="h-full w-full select-none object-fill"
               draggable={false}
-              style={{
-                transform: inspected_cell
-                  ? `scale(${n}) translate(${(-inspected_cell.x * 100) / n}%, ${(-inspected_cell.y * 100) / n}%)`
-                  : "scale(1)",
-                transformOrigin: "0 0",
-                imageRendering: inspected_cell ? "pixelated" : undefined,
-                transition: "transform 0.35s cubic-bezier(0.2, 0.7, 0.2, 1)"
-              }}
             />
             <div
               className={`pointer-events-none absolute inset-0 transition-opacity duration-300 ${
-                inspected_cell ? "opacity-0" : "opacity-100"
+                show_tile_view ? "opacity-0" : "opacity-100"
               }`}
             >
               <CutGrid n={n} filled={filled} hover={is_generating ? null : hover_cell} />
             </div>
 
-            {inspected_cell && !is_generating && (
+            {inspected_cell && (
+              <canvas
+                ref={canvas_ref}
+                className="absolute inset-0 z-10 h-full w-full"
+                style={{
+                  transform: is_expanded
+                    ? "translate(0%, 0%) scale(1)"
+                    : `translate(${(inspected_cell.x * 100) / n}%, ${(inspected_cell.y * 100) / n}%) scale(${1 / n})`,
+                  transformOrigin: "0 0",
+                  transition: "transform 0.35s cubic-bezier(0.2, 0.7, 0.2, 1)"
+                }}
+              />
+            )}
+
+            {show_tile_view && !is_generating && (
               <>
                 {([
                   { dx: -1, dy: 0, glyph: "←", label: "Previous tile left", position: "left-2 top-1/2 -translate-y-1/2" },
@@ -297,7 +464,7 @@ export function CutViewport({
               <span className="text-[var(--c-acc)]">
                 CUTTING Z{displayed_zoom} · {progress.progress}%
               </span>
-            ) : inspected_cell ? (
+            ) : show_tile_view ? (
               <span className="text-[var(--c-acc)]">
                 TILE Z{displayed_zoom} · X:{inspected_cell.x} Y:{inspected_cell.y}
               </span>
@@ -312,9 +479,9 @@ export function CutViewport({
             TILE {tile_px}PX
           </Readout>
           <Readout className="bottom-4 left-4 lg:bottom-6 lg:left-6">
-            {inspected_cell ? (
+            {show_tile_view ? (
               <span className="text-[var(--c-text)]">CLICK TO EXIT · ARROWS TO MOVE</span>
-            ) : hover_cell && !is_generating ? (
+            ) : hover_cell && !is_generating && !inspected_cell ? (
               <span className="text-[var(--c-text)]">
                 X:{hover_cell.x} Y:{hover_cell.y}{n > 1 ? " · CLICK TO VIEW TILE" : ""}
               </span>
