@@ -139,6 +139,38 @@ export function CutViewport({
     }
   };
 
+  const move_inspected = (dx: number, dy: number) => {
+    set_inspected_cell((cell) => {
+      if (!cell) return cell;
+      const x = cell.x + dx;
+      const y = cell.y + dy;
+      if (x < 0 || y < 0 || x >= n || y >= n) return cell;
+      return { x, y };
+    });
+  };
+
+  useEffect(() => {
+    if (!inspected_cell || is_generating) return;
+
+    const handle_key = (e: KeyboardEvent) => {
+      const moves: Record<string, [number, number]> = {
+        ArrowLeft: [-1, 0],
+        ArrowRight: [1, 0],
+        ArrowUp: [0, -1],
+        ArrowDown: [0, 1]
+      };
+      if (moves[e.key]) {
+        e.preventDefault();
+        move_inspected(...moves[e.key]);
+      } else if (e.key === "Escape") {
+        set_inspected_cell(null);
+      }
+    };
+
+    window.addEventListener("keydown", handle_key);
+    return () => window.removeEventListener("keydown", handle_key);
+  }, [!!inspected_cell, is_generating, n]);
+
   return (
     <section
       ref={section_ref}
@@ -228,6 +260,36 @@ export function CutViewport({
             >
               <CutGrid n={n} filled={filled} hover={is_generating ? null : hover_cell} />
             </div>
+
+            {inspected_cell && !is_generating && (
+              <>
+                {([
+                  { dx: -1, dy: 0, glyph: "←", label: "Previous tile left", position: "left-2 top-1/2 -translate-y-1/2" },
+                  { dx: 1, dy: 0, glyph: "→", label: "Next tile right", position: "right-2 top-1/2 -translate-y-1/2" },
+                  { dx: 0, dy: -1, glyph: "↑", label: "Tile above", position: "top-2 left-1/2 -translate-x-1/2" },
+                  { dx: 0, dy: 1, glyph: "↓", label: "Tile below", position: "bottom-2 left-1/2 -translate-x-1/2" }
+                ] as const)
+                  .filter(({ dx, dy }) => {
+                    const x = inspected_cell.x + dx;
+                    const y = inspected_cell.y + dy;
+                    return x >= 0 && y >= 0 && x < n && y < n;
+                  })
+                  .map(({ dx, dy, glyph, label, position }) => (
+                    <button
+                      key={glyph}
+                      aria-label={label}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        move_inspected(dx, dy);
+                      }}
+                      className={`boot data absolute z-20 flex h-10 w-10 cursor-pointer items-center justify-center border border-[var(--c-line)] bg-[#0c1219]/85 text-base text-[var(--c-text)] transition-colors hover:border-[var(--c-acc)] hover:bg-[#0c1219] hover:text-[var(--c-acc)] ${position}`}
+                      style={{ animationDelay: "150ms" }}
+                    >
+                      {glyph}
+                    </button>
+                  ))}
+              </>
+            )}
           </div>
 
           <Readout className="left-4 top-4 lg:left-6 lg:top-6">
@@ -251,7 +313,7 @@ export function CutViewport({
           </Readout>
           <Readout className="bottom-4 left-4 lg:bottom-6 lg:left-6">
             {inspected_cell ? (
-              <span className="text-[var(--c-text)]">CLICK TO EXIT TILE VIEW</span>
+              <span className="text-[var(--c-text)]">CLICK TO EXIT · ARROWS TO MOVE</span>
             ) : hover_cell && !is_generating ? (
               <span className="text-[var(--c-text)]">
                 X:{hover_cell.x} Y:{hover_cell.y}{n > 1 ? " · CLICK TO VIEW TILE" : ""}
