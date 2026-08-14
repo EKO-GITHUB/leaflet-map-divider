@@ -13,21 +13,12 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "@radix-ui/react-label": "^2.1.7",
-    "@radix-ui/react-progress": "^1.1.7",
-    "@radix-ui/react-slot": "^1.2.3",
-    "@radix-ui/react-switch": "^1.2.5",
     "@vercel/analytics": "^1.5.0",
-    "class-variance-authority": "^0.7.1",
-    "clsx": "^2.1.1",
     "jszip": "^3.10.1",
-    "lucide-react": "^0.428.0",
     "next": "16.0.10",
     "prettier": "^3.6.2",
     "react": "19.2.1",
-    "react-dom": "19.2.1",
-    "tailwind-merge": "^3.4.0",
-    "tailwindcss-animate": "^1.0.7"
+    "react-dom": "19.2.1"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.18",
