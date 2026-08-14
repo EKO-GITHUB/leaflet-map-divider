@@ -101,14 +101,7 @@ export function CutViewport({
   const was_open = useRef(false);
   const proxy_ref = useRef<{ canvas: HTMLCanvasElement; is_full_res: boolean } | null>(null);
   const draw_token = useRef(0);
-  const full_bitmap_ref = useRef<ImageBitmap | null>(null);
-  const full_promise_ref = useRef<Promise<ImageBitmap> | null>(null);
-
-  const release_full_bitmap = () => {
-    full_bitmap_ref.current?.close();
-    full_bitmap_ref.current = null;
-    full_promise_ref.current = null;
-  };
+  const blob_promise_ref = useRef<Promise<Blob> | null>(null);
 
   const displayed_zoom = is_generating ? progress.current_zoom_level : zoom;
   const n = Math.pow(2, displayed_zoom);
@@ -125,15 +118,8 @@ export function CutViewport({
     set_is_expanded(false);
   }, [zoom, image, is_generating]);
 
-  // hold the decoded full-resolution bitmap only while a tile view is open
   useEffect(() => {
-    if (!inspected_cell) {
-      release_full_bitmap();
-    }
-  }, [inspected_cell]);
-
-  useEffect(() => {
-    return () => release_full_bitmap();
+    blob_promise_ref.current = null;
   }, [image]);
 
   useEffect(() => {
@@ -231,35 +217,39 @@ export function CutViewport({
       ctx.fillRect(0, 0, size, size);
     }
 
-    if (full_bitmap_ref.current) {
-      paint(full_bitmap_ref.current, full_bitmap_ref.current.width);
-      return;
+    // refine from the original source, decoded off the main thread: blob
+    // sources decode on background threads (element sources decode on the
+    // main thread and stall the animation), and crop+resize at decode time
+    // keeps the resulting bitmap viewport-sized instead of full-resolution
+    if (!blob_promise_ref.current) {
+      blob_promise_ref.current = fetch(image.src).then((response) => response.blob());
     }
+    const full = image.element.naturalWidth;
+    const full_tile = full / n;
+    const crop = [
+      Math.round(inspected_cell.x * full_tile),
+      Math.round(inspected_cell.y * full_tile),
+      Math.round(full_tile),
+      Math.round(full_tile)
+    ] as const;
 
-    // decode from the blob: Chromium decodes blob sources off the main thread,
-    // while element sources decode on it and stall the animation
-    if (!full_promise_ref.current) {
-      full_promise_ref.current = fetch(image.src)
-        .then((response) => response.blob())
-        .then((blob) => createImageBitmap(blob));
-    }
-    const my_promise = full_promise_ref.current;
-    my_promise
+    blob_promise_ref.current
+      .then((blob) =>
+        createImageBitmap(blob, ...crop, {
+          resizeWidth: size,
+          resizeHeight: size,
+          resizeQuality: full_tile >= size ? "high" : "pixelated"
+        }).catch(() => createImageBitmap(blob, ...crop))
+      )
       .then((bitmap) => {
-        if (full_promise_ref.current !== my_promise) {
-          bitmap.close();
-          return;
-        }
-        full_bitmap_ref.current = bitmap;
         if (draw_token.current === token && canvas_ref.current) {
-          paint(bitmap, bitmap.width);
+          ctx.fillStyle = "#070a0f";
+          ctx.fillRect(0, 0, size, size);
+          ctx.drawImage(bitmap, 0, 0, size, size);
         }
+        bitmap.close();
       })
-      .catch(() => {
-        if (full_promise_ref.current === my_promise) {
-          full_promise_ref.current = null;
-        }
-      });
+      .catch(() => {});
   }, [inspected_cell, image, n]);
 
   // expand on the frame after the collapsed canvas is committed, so the transition runs
