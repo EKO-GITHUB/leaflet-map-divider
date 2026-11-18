@@ -10,6 +10,8 @@ interface TileGeneratorOptions {
   file_name: string;
   on_progress?: (progress: TileGenerationProgress) => void;
   on_error?: (error: string) => void;
+  // aborting stops the cut before the next tile (or while the zip is being built) and rejects with the signal's reason
+  signal?: AbortSignal;
 }
 
 interface TileGeneratorState {
@@ -21,6 +23,52 @@ interface TileGeneratorState {
 }
 
 const PROGRESS_BATCH_SIZE = 10;
+
+// yields to the browser for one frame; an abort ends the wait at once (requestAnimationFrame never fires in a
+// background tab)
+function next_frame(signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const on_abort = () => {
+      cancelAnimationFrame(frame);
+      reject(signal?.reason);
+    };
+    const frame = requestAnimationFrame(() => {
+      signal?.removeEventListener("abort", on_abort);
+      resolve();
+    });
+    signal?.addEventListener("abort", on_abort, { once: true });
+  });
+}
+
+// JSZip's generateAsync is generateInternalStream(...).accumulate(); the stream is paused on an abort
+function build_zip(zip: JSZip, signal?: AbortSignal): Promise<Blob> {
+  signal?.throwIfAborted();
+  const stream = zip.generateInternalStream({ type: "blob" });
+  if (!signal) return stream.accumulate();
+
+  return new Promise((resolve, reject) => {
+    const on_abort = () => {
+      stream.pause();
+      reject(signal.reason);
+    };
+    if (signal.aborted) {
+      on_abort();
+      return;
+    }
+    signal.addEventListener("abort", on_abort, { once: true });
+    stream.accumulate().then(
+      blob => {
+        signal.removeEventListener("abort", on_abort);
+        resolve(blob);
+      },
+      error => {
+        signal.removeEventListener("abort", on_abort);
+        reject(error);
+      }
+    );
+  });
+}
 
 function create_generator_state(): TileGeneratorState | null {
   try {
@@ -156,10 +204,13 @@ async function generate_zoom_level(
     output_format: OutputFormat;
     on_progress?: (processed_count: number) => void;
     on_tile_progress?: (x: number, y: number) => void;
+    signal?: AbortSignal;
   }
 ): Promise<void> {
-  const { image, level, tile_size, output_format, on_progress, on_tile_progress } = options;
+  const { image, level, tile_size, output_format, on_progress, on_tile_progress, signal } = options;
   const { zoom: zoom_level, tiles_per_side, level_size, scale } = level;
+
+  signal?.throwIfAborted();
 
   // the image sits at the top left of the level's square; under tile size "auto" it fills it exactly
   setup_canvas(state, level_size, level_size);
@@ -169,6 +220,8 @@ async function generate_zoom_level(
 
   for (let x = 0; x < tiles_per_side; x++) {
     for (let y = 0; y < tiles_per_side; y++) {
+      signal?.throwIfAborted();
+
       await generate_tile(state, {
         x,
         y,
@@ -181,7 +234,7 @@ async function generate_zoom_level(
       on_tile_progress?.(x, y);
 
       if (processed_count % PROGRESS_BATCH_SIZE === 0) {
-        await new Promise(resolve => requestAnimationFrame(resolve));
+        await next_frame(signal);
       }
     }
   }
@@ -190,8 +243,10 @@ async function generate_zoom_level(
 }
 
 export async function generate_tiles(options: TileGeneratorOptions): Promise<Blob> {
-  const { image, plan, output_format, on_progress, on_error } = options;
+  const { image, plan, output_format, on_progress, on_error, signal } = options;
   const { max_zoom: max_zoom_level, total_tiles } = plan;
+
+  signal?.throwIfAborted();
 
   const state = create_generator_state();
   if (!state) {
@@ -232,6 +287,7 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
         level: plan.levels[z],
         tile_size: plan.tile_size,
         output_format,
+        signal,
         on_tile_progress: () => {
           zoom_levels_progress[zoom_index].processed_tiles_in_level++;
           zoom_levels_progress[zoom_index].progress_percentage = Math.floor(
@@ -291,8 +347,9 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
       tiles_per_second: Math.round((processed_tile_count / ((Date.now() - start_time) / 1000)) * 10) / 10
     });
 
-    return await state.zip.generateAsync({ type: "blob" });
+    return await build_zip(state.zip, signal);
   } catch (error) {
+    if (signal?.aborted) throw signal.reason;
     const error_message = error instanceof Error ? error.message : "Unknown error occurred";
     on_error?.(error_message);
     throw error;

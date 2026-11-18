@@ -94,6 +94,12 @@ export function InstrumentApp() {
     generate_tiles(selected_image);
   };
 
+  // an abort during the zip step comes after the "complete" stage, so the saved notice is cleared here
+  const handle_abort = () => {
+    set_has_saved(false);
+    cancel_generation();
+  };
+
   const can_generate = !!selected_image && selected_image.plan.max_zoom > 0;
   const total_tiles = selected_image ? selected_image.plan.total_tiles : 0;
   const show_saved = has_saved && !is_generating && !generation_error;
@@ -306,7 +312,7 @@ export function InstrumentApp() {
                 </div>
 
                 <button
-                  onClick={cancel_generation}
+                  onClick={handle_abort}
                   className="mt-4 w-full border border-[var(--c-red)]/60 py-2 text-[11px] font-semibold tracking-[0.25em] text-[var(--c-red)] transition-colors hover:bg-[#ff6f66]/10"
                 >
                   ■ ABORT CUT

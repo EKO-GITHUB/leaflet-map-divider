@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { MapImage, OutputFormat, TileGenerationProgress } from "@/types/types";
 import { download_zip_file, generate_tiles } from "@/services/tile_generator";
 
@@ -15,6 +15,12 @@ export function useTileGeneration() {
   });
   const [output_format, set_output_format] = useState<OutputFormat>("png");
 
+  // the running cut's controller; null when no cut runs
+  const controller_ref = useRef<AbortController | null>(null);
+
+  // leaving the page stops the cut
+  useEffect(() => () => controller_ref.current?.abort(), []);
+
   const reset_state = useCallback(() => {
     set_progress({
       current_zoom_level: 0,
@@ -28,6 +34,11 @@ export function useTileGeneration() {
   }, []);
 
   const generate_tiles_handler = useCallback(async (image: MapImage) => {
+    controller_ref.current?.abort();
+    const controller = new AbortController();
+    const { signal } = controller;
+    controller_ref.current = controller;
+
     set_is_generating(true);
     set_error(null);
 
@@ -37,22 +48,37 @@ export function useTileGeneration() {
         plan: image.plan,
         output_format,
         file_name: image.file_name,
-        on_progress: set_progress,
-        on_error: set_error
+        signal,
+        // an aborted cut no longer writes to the panel
+        on_progress: next => {
+          if (!signal.aborted) set_progress(next);
+        },
+        on_error: message => {
+          if (!signal.aborted) set_error(message);
+        }
       });
 
+      signal.throwIfAborted();
       await download_zip_file(blob, image.file_name);
     } catch (error) {
-      const error_message = error instanceof Error ? error.message : "Failed to generate tiles";
-      set_error(error_message);
-      console.error("Tile generation failed:", error);
+      if (!signal.aborted) {
+        const error_message = error instanceof Error ? error.message : "Failed to generate tiles";
+        set_error(error_message);
+        console.error("Tile generation failed:", error);
+      }
     } finally {
-      set_is_generating(false);
-      setTimeout(reset_state, 2000);
+      // an aborted run's state was already reset by cancel_generation (and a newer run may own it now)
+      if (controller_ref.current === controller) {
+        controller_ref.current = null;
+        set_is_generating(false);
+        setTimeout(reset_state, 2000);
+      }
     }
   }, [output_format, reset_state]);
 
   const cancel_generation = useCallback(() => {
+    controller_ref.current?.abort();
+    controller_ref.current = null;
     set_is_generating(false);
     reset_state();
   }, [reset_state]);
