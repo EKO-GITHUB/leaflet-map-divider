@@ -1,31 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { TileGenerationProgress } from "@/types/types";
 
-export function useEta(is_generating: boolean, progress_percent: number) {
-  const [eta, set_eta] = useState("");
-  const start_ref = useRef<number | null>(null);
+// The remaining time follows from the run's own tile rate, so it is derived while rendering (no effect, no clock).
+export function useEta(is_generating: boolean, progress: TileGenerationProgress) {
+  const { tiles_per_second, total_tiles, processed_tiles } = progress;
+  if (!is_generating || !tiles_per_second || processed_tiles === 0) return "";
 
-  useEffect(() => {
-    if (!is_generating) {
-      start_ref.current = null;
-      set_eta("");
-      return;
-    }
+  const remaining = ((total_tiles - processed_tiles) / tiles_per_second) * 1000;
+  if (remaining <= 1000) return "";
 
-    if (start_ref.current === null) {
-      start_ref.current = Date.now();
-    }
-
-    if (progress_percent > 0) {
-      const elapsed = Date.now() - start_ref.current;
-      const remaining = (elapsed / progress_percent) * (100 - progress_percent);
-
-      if (remaining > 1000) {
-        const minutes = Math.floor(remaining / 60000);
-        const seconds = Math.floor((remaining % 60000) / 1000);
-        set_eta(minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`);
-      }
-    }
-  }, [is_generating, progress_percent]);
-
-  return eta;
+  const minutes = Math.floor(remaining / 60000);
+  const seconds = Math.floor((remaining % 60000) / 1000);
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
 }

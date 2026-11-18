@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useRef, useState } from "react";
 import Link from "next/link";
 import { useImageUpload } from "@/hooks/use_image_upload";
 import { useTileGeneration } from "@/hooks/use_tile_generation";
@@ -65,17 +65,23 @@ export function InstrumentApp() {
   const input_ref = useRef<HTMLInputElement>(null);
   const [preview_zoom, set_preview_zoom] = useState(0);
   const [has_saved, set_has_saved] = useState(false);
-  const eta = useEta(is_generating, progress.progress);
+  const eta = useEta(is_generating, progress);
 
-  useEffect(() => {
+  const [previewed_image, set_previewed_image] = useState(selected_image);
+  const [seen_stage, set_seen_stage] = useState(progress.current_stage);
+
+  // state adjusted while rendering when its inputs change, not in an effect
+  if (previewed_image !== selected_image) {
+    set_previewed_image(selected_image);
     set_preview_zoom(selected_image ? Math.min(1, selected_image.max_zoom_level) : 0);
-  }, [selected_image]);
+  }
 
-  useEffect(() => {
+  if (seen_stage !== progress.current_stage) {
+    set_seen_stage(progress.current_stage);
     if (progress.current_stage === "complete") {
       set_has_saved(true);
     }
-  }, [progress.current_stage]);
+  }
 
   const handle_eject = () => {
     if (input_ref.current) {

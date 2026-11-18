@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useEffectEvent, useRef, useState } from "react";
 import { MapImage, TileGenerationProgress } from "@/types/types";
 
 function CutGrid({ n, filled, hover }: {
@@ -109,13 +109,19 @@ export function CutViewport({
   const zoom_row = progress.zoom_levels_progress.find(z => z.zoom_level === displayed_zoom);
   const filled = is_generating && zoom_row ? zoom_row.processed_tiles_in_level : 0;
 
+  // a new zoom, image or run closes the inspected tile (state adjusted while rendering, the timer in an effect)
+  const [view_key, set_view_key] = useState({ zoom, image, is_generating });
+  if (view_key.zoom !== zoom || view_key.image !== image || view_key.is_generating !== is_generating) {
+    set_view_key({ zoom, image, is_generating });
+    set_inspected_cell(null);
+    set_is_expanded(false);
+  }
+
   useEffect(() => {
     if (close_timer.current !== null) {
       window.clearTimeout(close_timer.current);
       close_timer.current = null;
     }
-    set_inspected_cell(null);
-    set_is_expanded(false);
   }, [zoom, image, is_generating]);
 
   useEffect(() => {
@@ -284,27 +290,31 @@ export function CutViewport({
     });
   };
 
-  useEffect(() => {
-    if (!inspected_cell || is_generating) return;
-
-    const handle_key = (e: KeyboardEvent) => {
-      const moves: Record<string, [number, number]> = {
-        ArrowLeft: [-1, 0],
-        ArrowRight: [1, 0],
-        ArrowUp: [0, -1],
-        ArrowDown: [0, 1]
-      };
-      if (moves[e.key]) {
-        e.preventDefault();
-        move_inspected(...moves[e.key]);
-      } else if (e.key === "Escape") {
-        close_tile();
-      }
+  // an effect event reads the latest handlers, so the listener is only re-added when a tile opens or closes
+  const on_inspect_key = useEffectEvent((e: KeyboardEvent) => {
+    const moves: Record<string, [number, number]> = {
+      ArrowLeft: [-1, 0],
+      ArrowRight: [1, 0],
+      ArrowUp: [0, -1],
+      ArrowDown: [0, 1]
     };
+    if (moves[e.key]) {
+      e.preventDefault();
+      move_inspected(...moves[e.key]);
+    } else if (e.key === "Escape") {
+      close_tile();
+    }
+  });
 
+  const is_inspecting = inspected_cell !== null;
+
+  useEffect(() => {
+    if (!is_inspecting || is_generating) return;
+
+    const handle_key = (e: KeyboardEvent) => on_inspect_key(e);
     window.addEventListener("keydown", handle_key);
     return () => window.removeEventListener("keydown", handle_key);
-  }, [!!inspected_cell, is_generating, n]);
+  }, [is_inspecting, is_generating]);
 
   useEffect(() => {
     const section = section_ref.current;
