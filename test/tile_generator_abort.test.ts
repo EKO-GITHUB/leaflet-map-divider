@@ -1,15 +1,20 @@
 import JSZip from "jszip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { generate_tiles } from "@/services/tile_generator";
+import { generate_tiles, MAX_PENDING_ENCODES } from "@/services/tile_generator";
 import { plan_tiles, TilePlan } from "@/services/tile_plan";
 
 // a 1x1 transparent PNG, the fake canvas's every tile
-const TILE_DATA_URL =
-  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+const TILE_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+  "base64"
+);
+
+// the cut yields to the browser after every 10th tile that reaches the zip
+const PROGRESS_BATCH_SIZE = 10;
 
 interface FakeCanvasLog {
   encoded_tiles: number;
-  // called after each encoded tile, so a test can abort mid-cut
+  // called when a tile's encode starts, so a test can abort mid-cut
   on_encode?: (count: number) => void;
 }
 
@@ -19,12 +24,18 @@ function fake_canvas(log: FakeCanvasLog) {
     width: 0,
     height: 0,
     getContext: () => ctx,
-    toDataURL: () => {
+    toBlob: (callback: (blob: Blob | null) => void, type?: string) => {
       log.encoded_tiles++;
       log.on_encode?.(log.encoded_tiles);
-      return TILE_DATA_URL;
+      setTimeout(() => callback(new Blob([TILE_PNG], { type })), 0);
     }
   };
+}
+
+// a MessageChannel whose messages never arrive: the cut's yield to the browser never ends on its own
+class StuckMessageChannel {
+  port1 = { onmessage: null as unknown, close: () => {} };
+  port2 = { postMessage: () => {} };
 }
 
 function valid_plan(size: number): TilePlan {
@@ -42,9 +53,6 @@ let log: FakeCanvasLog;
 beforeEach(() => {
   log = { encoded_tiles: 0 };
   vi.stubGlobal("document", { createElement: () => fake_canvas(log) });
-  // frames come from a timer, as in a page; cancelling one is a clearTimeout
-  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => setTimeout(() => callback(0), 1));
-  vi.stubGlobal("cancelAnimationFrame", (handle: number) => clearTimeout(handle));
 });
 
 afterEach(() => {
@@ -107,18 +115,17 @@ describe("generate_tiles with an AbortSignal", () => {
     expect(log.encoded_tiles).toBe(5);
   });
 
-  it("ends a frame wait at once when aborted during it", async () => {
+  it("ends a wait for the browser at once when aborted during it", async () => {
     const zip_spy = vi.spyOn(JSZip.prototype, "generateInternalStream");
     const controller = new AbortController();
-    // the cut waits for a frame after every 10th tile; this frame never comes
-    vi.stubGlobal("requestAnimationFrame", () => 0);
-    vi.stubGlobal("cancelAnimationFrame", () => {});
-    log.on_encode = count => {
-      if (count === 10) setTimeout(() => controller.abort(), 5);
-    };
+    // the cut yields after every 10th tile in the zip; this yield never ends
+    vi.stubGlobal("MessageChannel", StuckMessageChannel);
+    const { promise } = cut(1024, controller.signal);
+    setTimeout(() => controller.abort(), 50);
 
-    await expect(cut(1024, controller.signal).promise).rejects.toMatchObject({ name: "AbortError" });
-    expect(log.encoded_tiles).toBe(10);
+    await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+    // stuck after the 10th tile reached the zip, with the encodes after it already started
+    expect(log.encoded_tiles).toBe(PROGRESS_BATCH_SIZE + MAX_PENDING_ENCODES - 1);
     expect(zip_spy).not.toHaveBeenCalled();
   });
 

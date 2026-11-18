@@ -23,28 +23,35 @@ interface TileGeneratorState {
 }
 
 const PROGRESS_BATCH_SIZE = 10;
+// encodes started and not yet in the zip; Chrome encodes WebP off the main thread, so several overlap
+export const MAX_PENDING_ENCODES = 16;
 
-// yields to the browser for one frame; an abort ends the wait at once (requestAnimationFrame never fires in a
-// background tab)
-function next_frame(signal?: AbortSignal): Promise<void> {
+// yields to the browser (a task, so it can render and handle input) every PROGRESS_BATCH_SIZE tiles; an abort ends
+// the wait at once. A task, not a frame: requestAnimationFrame caps the cut at one batch per frame and never fires in
+// a background tab
+function next_task(signal?: AbortSignal): Promise<void> {
   signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
+    const channel = new MessageChannel();
     const on_abort = () => {
-      cancelAnimationFrame(frame);
+      channel.port1.close();
       reject(signal?.reason);
     };
-    const frame = requestAnimationFrame(() => {
+    channel.port1.onmessage = () => {
+      channel.port1.close();
       signal?.removeEventListener("abort", on_abort);
       resolve();
-    });
+    };
     signal?.addEventListener("abort", on_abort, { once: true });
+    channel.port2.postMessage(null);
   });
 }
 
-// JSZip's generateAsync is generateInternalStream(...).accumulate(); the stream is paused on an abort
+// JSZip's generateAsync is generateInternalStream(...).accumulate(); the stream is paused on an abort. Entries are
+// stored uncompressed: PNG and WebP tiles are compressed already
 function build_zip(zip: JSZip, signal?: AbortSignal): Promise<Blob> {
   signal?.throwIfAborted();
-  const stream = zip.generateInternalStream({ type: "blob" });
+  const stream = zip.generateInternalStream({ type: "blob", compression: "STORE" });
   if (!signal) return stream.accumulate();
 
   return new Promise((resolve, reject) => {
@@ -145,7 +152,27 @@ function draw_scaled_image(
   }
 }
 
-async function generate_tile(
+// an encode that has been started but whose bytes are not in the zip yet
+interface PendingTile {
+  path: string;
+  label: string;
+  bytes: Promise<ArrayBuffer>;
+}
+
+// quality 1.0 makes Chrome's WebP lossless (PNG ignores it), as toDataURL(type, 1.0) did
+function encode_canvas(canvas: HTMLCanvasElement, mime_type: string): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      blob => (blob ? resolve(blob) : reject(new Error("the canvas could not be encoded"))),
+      mime_type,
+      1.0
+    );
+  });
+}
+
+// draws the tile and starts encoding it; toBlob copies the canvas when it is called, so the tile canvas can be redrawn
+// for the next tile while this one is still encoding
+function start_tile(
   state: TileGeneratorState,
   options: {
     x: number;
@@ -154,8 +181,9 @@ async function generate_tile(
     tile_size: number;
     output_format: OutputFormat;
   }
-): Promise<void> {
+): PendingTile {
   const { x, y, zoom_level, tile_size, output_format } = options;
+  const label = `tile ${x},${y} at zoom ${zoom_level}`;
 
   try {
     const start_x = x * tile_size;
@@ -182,17 +210,27 @@ async function generate_tile(
       throw new Error(`Unsupported output format: ${output_format}`);
     }
 
-    const data_url = state.tile_canvas.toDataURL(mime_type, 1.0);
-    const base64_data = data_url.replace(/^data:image\/(png|jpg|webp);base64,/, "");
+    const bytes = encode_canvas(state.tile_canvas, mime_type).then(blob => blob.arrayBuffer());
+    // the error is reported when the tile is awaited; an encode left behind by an abort must not be an unhandled
+    // rejection
+    bytes.catch(() => {});
 
-    state.zip.file(
-      `${zoom_level}/${y}/${x}.${output_format}`,
-      base64_data,
-      { base64: true }
-    );
+    return { path: `${zoom_level}/${y}/${x}.${output_format}`, label, bytes };
   } catch (error) {
-    throw new Error(`Failed to generate tile ${x},${y} at zoom ${zoom_level}: ${error}`);
+    throw new Error(`Failed to generate ${label}: ${error}`);
   }
+}
+
+// waits for a started encode and adds its bytes to the zip (no base64 round trip)
+async function finish_tile(state: TileGeneratorState, tile: PendingTile, signal?: AbortSignal): Promise<void> {
+  let bytes: ArrayBuffer;
+  try {
+    bytes = await tile.bytes;
+  } catch (error) {
+    throw new Error(`Failed to generate ${tile.label}: ${error}`);
+  }
+  signal?.throwIfAborted();
+  state.zip.file(tile.path, bytes, { binary: true });
 }
 
 async function generate_zoom_level(
@@ -203,7 +241,7 @@ async function generate_zoom_level(
     tile_size: number;
     output_format: OutputFormat;
     on_progress?: (processed_count: number) => void;
-    on_tile_progress?: (x: number, y: number) => void;
+    on_tile_progress?: () => void;
     signal?: AbortSignal;
   }
 ): Promise<void> {
@@ -217,26 +255,36 @@ async function generate_zoom_level(
   draw_scaled_image(state, image, image.naturalWidth / scale, image.naturalHeight / scale, scale);
 
   let processed_count = 0;
+  // encodes in flight, oldest first; they are added to the zip in the order they were started
+  const pending: PendingTile[] = [];
+
+  const finish_oldest = async () => {
+    const tile = pending.shift();
+    if (!tile) return;
+    await finish_tile(state, tile, signal);
+
+    processed_count++;
+    on_tile_progress?.();
+
+    if (processed_count % PROGRESS_BATCH_SIZE === 0) {
+      await next_task(signal);
+    }
+  };
 
   for (let x = 0; x < tiles_per_side; x++) {
     for (let y = 0; y < tiles_per_side; y++) {
       signal?.throwIfAborted();
 
-      await generate_tile(state, {
-        x,
-        y,
-        zoom_level,
-        tile_size,
-        output_format
-      });
+      pending.push(start_tile(state, { x, y, zoom_level, tile_size, output_format }));
 
-      processed_count++;
-      on_tile_progress?.(x, y);
-
-      if (processed_count % PROGRESS_BATCH_SIZE === 0) {
-        await next_frame(signal);
+      if (pending.length >= MAX_PENDING_ENCODES) {
+        await finish_oldest();
       }
     }
+  }
+
+  while (pending.length > 0) {
+    await finish_oldest();
   }
 
   on_progress?.(processed_count);
