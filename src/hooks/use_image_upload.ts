@@ -44,7 +44,7 @@ export function useImageUpload() {
       const validation = validate_image_dimensions(img);
 
       if (!validation.is_valid) {
-        set_error(validation.error || "Invalid image");
+        set_error(validation.error);
         set_selected_image(null);
         URL.revokeObjectURL(img.src);
         return;
@@ -52,11 +52,11 @@ export function useImageUpload() {
 
       const new_image: MapImage = {
         element: img,
-        width: validation.width!,
-        height: validation.height!,
+        width: validation.plan.width,
+        height: validation.plan.height,
         file_name: file.name,
         src: img.src,
-        max_zoom_level: validation.max_zoom_level!
+        plan: validation.plan
       };
 
       set_selected_image(new_image);

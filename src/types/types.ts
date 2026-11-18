@@ -1,10 +1,4 @@
-export interface ImageValidationResult {
-  is_valid: boolean;
-  error?: string;
-  width?: number;
-  height?: number;
-  max_zoom_level?: number;
-}
+import type { TilePlan } from "@/services/tile_plan";
 
 export interface ZoomLevelProgress {
   zoom_level: number;
@@ -32,5 +26,5 @@ export interface MapImage {
   height: number;
   file_name: string;
   src: string;
-  max_zoom_level: number;
+  plan: TilePlan;
 }

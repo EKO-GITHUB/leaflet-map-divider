@@ -34,7 +34,7 @@ export function useTileGeneration() {
     try {
       const blob = await generate_tiles({
         image: image.element,
-        max_zoom_level: image.max_zoom_level,
+        plan: image.plan,
         output_format,
         file_name: image.file_name,
         on_progress: set_progress,

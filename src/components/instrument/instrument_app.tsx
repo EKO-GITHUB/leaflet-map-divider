@@ -5,11 +5,8 @@ import Link from "next/link";
 import { useImageUpload } from "@/hooks/use_image_upload";
 import { useTileGeneration } from "@/hooks/use_tile_generation";
 import { useEta } from "@/hooks/use_eta";
+import { plan_level } from "@/services/tile_plan";
 import { CutViewport } from "./cut_viewport";
-
-function total_tile_count(max_zoom_level: number) {
-  return (Math.pow(4, max_zoom_level + 1) - 1) / 3;
-}
 
 function RailSection({ index, title, delay, children }: {
   index: string;
@@ -73,7 +70,7 @@ export function InstrumentApp() {
   // state adjusted while rendering when its inputs change, not in an effect
   if (previewed_image !== selected_image) {
     set_previewed_image(selected_image);
-    set_preview_zoom(selected_image ? Math.min(1, selected_image.max_zoom_level) : 0);
+    set_preview_zoom(selected_image ? Math.min(1, selected_image.plan.max_zoom) : 0);
   }
 
   if (seen_stage !== progress.current_stage) {
@@ -97,8 +94,8 @@ export function InstrumentApp() {
     generate_tiles(selected_image);
   };
 
-  const can_generate = !!selected_image && selected_image.max_zoom_level > 0;
-  const total_tiles = selected_image ? total_tile_count(selected_image.max_zoom_level) : 0;
+  const can_generate = !!selected_image && selected_image.plan.max_zoom > 0;
+  const total_tiles = selected_image ? selected_image.plan.total_tiles : 0;
   const show_saved = has_saved && !is_generating && !generation_error;
 
   return (
@@ -156,10 +153,10 @@ export function InstrumentApp() {
                 <DataRow label="File">{selected_image.file_name}</DataRow>
                 <DataRow label="Size">{selected_image.width} × {selected_image.height} px</DataRow>
                 <DataRow label="Max zoom">
-                  <span className="text-[var(--c-acc)]">z{selected_image.max_zoom_level}</span>
+                  <span className="text-[var(--c-acc)]">z{selected_image.plan.max_zoom}</span>
                 </DataRow>
                 <DataRow label="Tile at max">
-                  {selected_image.width / Math.pow(2, selected_image.max_zoom_level)} px
+                  {selected_image.plan.tile_size} px
                 </DataRow>
                 <button
                   onClick={handle_eject}
@@ -189,7 +186,7 @@ export function InstrumentApp() {
             {selected_image ? (
               <>
                 <div className="flex flex-wrap gap-1.5">
-                  {Array.from({ length: selected_image.max_zoom_level + 1 }, (_, z) => (
+                  {Array.from({ length: selected_image.plan.max_zoom + 1 }, (_, z) => (
                     <button
                       key={z}
                       onClick={() => set_preview_zoom(z)}
@@ -218,7 +215,7 @@ export function InstrumentApp() {
                       </span>{" "}
                       tiles of{" "}
                       <span className="data text-[var(--c-text)]">
-                        {selected_image.width / Math.pow(2, preview_zoom)}px
+                        {plan_level(selected_image.plan, preview_zoom).source_tile_size}px
                       </span>
                       <br />
                       Scroll on the viewport to change z · click a cell to

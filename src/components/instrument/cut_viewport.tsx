@@ -105,7 +105,7 @@ export function CutViewport({
 
   const displayed_zoom = is_generating ? progress.current_zoom_level : zoom;
   const n = Math.pow(2, displayed_zoom);
-  const tile_px = image ? Math.round(image.width / n) : 0;
+  const tile_px = image ? Math.round(image.plan.padded_size / n) : 0;
   const zoom_row = progress.zoom_levels_progress.find(z => z.zoom_level === displayed_zoom);
   const filled = is_generating && zoom_row ? zoom_row.processed_tiles_in_level : 0;
 
@@ -324,7 +324,7 @@ export function CutViewport({
       e.preventDefault();
       if (is_generating) return;
       const delta = e.deltaY > 0 ? -1 : 1;
-      on_zoom_change(Math.min(Math.max(zoom + delta, 0), image.max_zoom_level));
+      on_zoom_change(Math.min(Math.max(zoom + delta, 0), image.plan.max_zoom));
     };
 
     section.addEventListener("wheel", handle_wheel, { passive: false });

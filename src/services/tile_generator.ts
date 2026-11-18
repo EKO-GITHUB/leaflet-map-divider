@@ -1,10 +1,11 @@
 import JSZip from "jszip";
 import { OutputFormat, TileGenerationProgress, ZoomLevelProgress } from "@/types/types";
 import { MIME_TYPES } from "@/constants/constants";
+import { TileLevel, TilePlan } from "@/services/tile_plan";
 
 interface TileGeneratorOptions {
   image: HTMLImageElement;
-  max_zoom_level: number;
+  plan: TilePlan;
   output_format: OutputFormat;
   file_name: string;
   on_progress?: (progress: TileGenerationProgress) => void;
@@ -49,29 +50,15 @@ function cleanup_generator_state(state: TileGeneratorState) {
   state.tile_canvas.height = 0;
 }
 
-function calculate_total_tiles(max_zoom_level: number): number {
-  let total = 0;
-  for (let z = max_zoom_level; z >= 0; z--) {
-    const tiles_per_side = Math.pow(2, z);
-    total += tiles_per_side * tiles_per_side;
-  }
-  return total;
-}
-
-function initialize_zoom_levels_progress(max_zoom_level: number): ZoomLevelProgress[] {
-  const zoom_levels: ZoomLevelProgress[] = [];
-  for (let z = max_zoom_level; z >= 0; z--) {
-    const tiles_per_side = Math.pow(2, z);
-    const total_tiles_in_level = tiles_per_side * tiles_per_side;
-    zoom_levels.push({
-      zoom_level: z,
-      total_tiles_in_level,
-      processed_tiles_in_level: 0,
-      progress_percentage: 0,
-      is_complete: false
-    });
-  }
-  return zoom_levels;
+// the cut runs from the maximum zoom down to z0
+function initialize_zoom_levels_progress(plan: TilePlan): ZoomLevelProgress[] {
+  return [...plan.levels].reverse().map(level => ({
+    zoom_level: level.zoom,
+    total_tiles_in_level: level.tile_count,
+    processed_tiles_in_level: 0,
+    progress_percentage: 0,
+    is_complete: false
+  }));
 }
 
 
@@ -164,24 +151,20 @@ async function generate_zoom_level(
   state: TileGeneratorState,
   options: {
     image: HTMLImageElement;
-    zoom_level: number;
-    max_zoom_level: number;
+    level: TileLevel;
+    tile_size: number;
     output_format: OutputFormat;
     on_progress?: (processed_count: number) => void;
     on_tile_progress?: (x: number, y: number) => void;
   }
 ): Promise<void> {
-  const { image, zoom_level, max_zoom_level, output_format, on_progress, on_tile_progress } = options;
+  const { image, level, tile_size, output_format, on_progress, on_tile_progress } = options;
+  const { zoom: zoom_level, tiles_per_side, level_size, scale } = level;
 
-  const scale = Math.pow(2, max_zoom_level - zoom_level);
-  const scaled_width = image.naturalWidth / scale;
-  const scaled_height = image.naturalHeight / scale;
+  // the image sits at the top left of the level's square; under tile size "auto" it fills it exactly
+  setup_canvas(state, level_size, level_size);
+  draw_scaled_image(state, image, image.naturalWidth / scale, image.naturalHeight / scale, scale);
 
-  setup_canvas(state, scaled_width, scaled_height);
-  draw_scaled_image(state, image, scaled_width, scaled_height, scale);
-
-  const tiles_per_side = Math.pow(2, zoom_level);
-  const tile_size = scaled_width / tiles_per_side;
   let processed_count = 0;
 
   for (let x = 0; x < tiles_per_side; x++) {
@@ -207,7 +190,8 @@ async function generate_zoom_level(
 }
 
 export async function generate_tiles(options: TileGeneratorOptions): Promise<Blob> {
-  const { image, max_zoom_level, output_format, on_progress, on_error } = options;
+  const { image, plan, output_format, on_progress, on_error } = options;
+  const { max_zoom: max_zoom_level, total_tiles } = plan;
 
   const state = create_generator_state();
   if (!state) {
@@ -217,8 +201,7 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
   }
 
   try {
-    const total_tiles = calculate_total_tiles(max_zoom_level);
-    const zoom_levels_progress = initialize_zoom_levels_progress(max_zoom_level);
+    const zoom_levels_progress = initialize_zoom_levels_progress(plan);
     let processed_tile_count = 0;
     const start_time = Date.now();
     let last_update_time = start_time;
@@ -246,8 +229,8 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
 
       await generate_zoom_level(state, {
         image,
-        zoom_level: z,
-        max_zoom_level,
+        level: plan.levels[z],
+        tile_size: plan.tile_size,
         output_format,
         on_tile_progress: () => {
           zoom_levels_progress[zoom_index].processed_tiles_in_level++;
