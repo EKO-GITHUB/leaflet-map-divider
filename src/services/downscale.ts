@@ -1,8 +1,10 @@
-// How the levels below the top zoom are made.
-// - "pixel": every level is drawn from the source with nearest-neighbour sampling (sharp pixel art).
-// - "smooth": every level is the level above it shrunk by an exact 2x2 box average, weighted by alpha.
+// How the levels below the top zoom are made. Each level is the level above it halved:
+// - "pixel": pick_2x keeps the top-left pixel of each 2x2 cell, so a pixel of a level is the source pixel at the top
+//   left of the cell it covers, (x * scale, y * scale): nearest-neighbour sampling that keeps pixel art sharp.
+// - "smooth": downscale_2x, an exact 2x2 box average weighted by alpha.
 // The math here is pure integer code (no canvas, no DOM), so the browser and the command-line cutter produce the same
-// pixels from the same source pixels.
+// pixels from the same source pixels. (A canvas drawImage with smoothing off is not used for the lower levels: its
+// nearest-neighbour picks follow no fixed rule.)
 export type DownscaleMode = "pixel" | "smooth";
 
 export const DOWNSCALE_MODES: readonly DownscaleMode[] = ["pixel", "smooth"];
@@ -78,20 +80,9 @@ export function downscale_2x(
   height: number,
   out: Uint8ClampedArray = new Uint8ClampedArray((width / 2) * (height / 2) * 4)
 ): Uint8ClampedArray {
-  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 2 || height < 2) {
-    throw new RangeError(`downscale_2x: width and height must be integers of at least 2, got ${width}x${height}`);
-  }
-  if (width % 2 !== 0 || height % 2 !== 0) {
-    throw new RangeError(`downscale_2x: width and height must be even, got ${width}x${height}`);
-  }
-  if (src.length < width * height * 4) {
-    throw new RangeError(`downscale_2x: ${src.length} bytes cannot hold a ${width}x${height} RGBA image`);
-  }
+  check_halving("downscale_2x", src, width, height, out.length);
   const out_width = width / 2;
   const out_height = height / 2;
-  if (out.length < out_width * out_height * 4) {
-    throw new RangeError(`downscale_2x: the output (${out.length} bytes) cannot hold ${out_width}x${out_height} pixels`);
-  }
 
   const row_bytes = width * 4;
   for (let y = 0; y < out_height; y++) {
@@ -105,4 +96,72 @@ export function downscale_2x(
     }
   }
   return out;
+}
+
+function check_halving(name: string, src: Pixels, width: number, height: number, out_length: number): void {
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 2 || height < 2) {
+    throw new RangeError(`${name}: width and height must be integers of at least 2, got ${width}x${height}`);
+  }
+  if (width % 2 !== 0 || height % 2 !== 0) {
+    throw new RangeError(`${name}: width and height must be even, got ${width}x${height}`);
+  }
+  if (src.length < width * height * 4) {
+    throw new RangeError(`${name}: ${src.length} bytes cannot hold a ${width}x${height} RGBA image`);
+  }
+  if (out_length < (width / 2) * (height / 2) * 4) {
+    throw new RangeError(`${name}: the output (${out_length} bytes) cannot hold ${width / 2}x${height / 2} pixels`);
+  }
+}
+
+// the "pixel" halving: an RGBA image of even width and height at half its size, keeping the top-left pixel of each
+// 2x2 block. Repeated, it keeps the source pixel at the top left of every scale x scale cell, so a pyramid can be built
+// level by level (or band by band, like downscale_2x) and still sample the source directly
+export function pick_2x(
+  src: Pixels,
+  width: number,
+  height: number,
+  out: Uint8ClampedArray = new Uint8ClampedArray((width / 2) * (height / 2) * 4)
+): Uint8ClampedArray {
+  check_halving("pick_2x", src, width, height, out.length);
+  const out_width = width / 2;
+  const out_height = height / 2;
+  const row_bytes = width * 4;
+  // the pixels as 32-bit words where the buffers are aligned (a subarray may not be)
+  if (src.byteOffset % 4 === 0 && out.byteOffset % 4 === 0) {
+    const src32 = new Uint32Array(src.buffer, src.byteOffset, width * height);
+    const out32 = new Uint32Array(out.buffer, out.byteOffset, out_width * out_height);
+    for (let y = 0; y < out_height; y++) {
+      const top = 2 * y * width;
+      const o = y * out_width;
+      for (let x = 0; x < out_width; x++) out32[o + x] = src32[top + 2 * x];
+    }
+    return out;
+  }
+  for (let y = 0; y < out_height; y++) {
+    const top = 2 * y * row_bytes;
+    let o = y * out_width * 4;
+    for (let x = 0; x < out_width; x++) {
+      const i = top + x * 8;
+      out[o] = src[i];
+      out[o + 1] = src[i + 1];
+      out[o + 2] = src[i + 2];
+      out[o + 3] = src[i + 3];
+      o += 4;
+    }
+  }
+  return out;
+}
+
+export type Halving = (src: Pixels, width: number, height: number, out?: Uint8ClampedArray) => Uint8ClampedArray;
+
+// the halving that makes a level from the one above in a downscale mode
+export function halving_of(mode: DownscaleMode): Halving {
+  switch (mode) {
+    case "pixel":
+      return pick_2x;
+    case "smooth":
+      return downscale_2x;
+    default:
+      throw new RangeError(`Unknown downscale mode: ${mode as string}`);
+  }
 }

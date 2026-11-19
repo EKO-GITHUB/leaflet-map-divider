@@ -3,7 +3,8 @@
 [![Live Demo](https://img.shields.io/badge/demo-live-brightgreen.svg)](https://leafletmapdivider.com)
 
 Cuts a large image into a tile pyramid for [Leaflet](https://leafletjs.com) (`L.tileLayer` on `L.CRS.Simple`) and
-saves it as one zip. Everything runs in your browser: the image never leaves your device.
+saves it as one zip. Everything runs in your browser: the image never leaves your device. A
+[command-line version](#command-line) cuts the same tiles straight into a folder.
 
 ## How it works
 
@@ -24,7 +25,7 @@ cannot store them (a private window, blocked site data) they still apply while t
 | Option | Choices (default first) | What it does |
 |---|---|---|
 | Format | **PNG**, WebP | The tile encoding. Both keep transparency and are lossless (WebP is encoded at quality 1.0, which browsers write losslessly); WebP archives are smaller. |
-| Downscale | **Pixel**, Smooth | How the levels below the maximum zoom are made. Pixel samples the source nearest-neighbour (no smoothing), which keeps pixel art sharp. Smooth builds each level from the one above with an exact 2×2 box average weighted by alpha (premultiplied, integer math), for painted, photographic and 3D maps. The maximum zoom is the same in both. |
+| Downscale | **Pixel**, Smooth | How the levels below the maximum zoom are made, each from the one above. Pixel keeps the top-left pixel of every 2×2 block, so a tile pixel is the source pixel at the top left of the cell it covers (nearest-neighbour, no smoothing), which keeps pixel art sharp. Smooth takes an exact 2×2 box average weighted by alpha (premultiplied, integer math), for painted, photographic and 3D maps. The maximum zoom is the same in both. |
 | Tile size | **Auto**, 256 | Auto: the image is padded to a square of its longest side (plus one pixel when that is odd), and that side is halved while it is even and at least 256 px. The number of halvings is the maximum zoom and the side left is the tile size: 1024 px gives z3 with 128 px tiles, 1632 px z3 with 204 px tiles. 256: tiles of exactly 256 px; the image is padded to the smallest 256·2ⁿ square that holds it, and n is the maximum zoom (1200×800 px is padded to 2048 px, z0 to z3). |
 | Blank tiles | **Skip**, Keep | Skip leaves out every tile whose pixels are all fully transparent (alpha 0), such as tiles of padding only; Keep writes every tile. |
 
@@ -137,6 +138,37 @@ map.fitBounds(bounds);
 
 To zoom in past the source's pixels, raise `maxZoom` and keep `maxNativeZoom` at `max_zoom`.
 
+## Command line
+
+`pnpm cut` cuts an image on your computer, with no browser limits, into a folder instead of a zip:
+
+```
+pnpm cut <image> <out_dir> [--tile auto|256] [--downscale pixel|smooth] [--skip-blank] [--format png|webp]
+                           [--force] [--quiet] [--json]
+```
+
+| Option | Default | Same as |
+|---|---|---|
+| `--tile auto\|256` | `auto` | Tile size |
+| `--downscale pixel\|smooth` | `pixel` | Downscale |
+| `--skip-blank` | off: every tile is written | Blank tiles: Skip (the site's default) |
+| `--format png\|webp` | `png` | Format (both lossless) |
+| `--force` | off | Replace an earlier cut in `<out_dir>`: its zoom folders, `tiles.json` and `preview.webp`. A folder that holds anything else is never cleared, and without `--force` the folder must be empty or new. |
+| `--quiet`, `--json` | off | No progress; or print the summary (seconds, peak memory, the manifest) as one JSON line. |
+
+- The folder holds what the archive holds: `{z}/{y}/{x}.<format>`, `preview.webp` and `tiles.json`, which is written
+  last, so a folder without `tiles.json` is an unfinished cut. The manifest is the archive's, field for field.
+- With the same source and options the command line and the site cut the same tiles, pixel for pixel, and the same
+  `tiles.json` apart from `created_at`. The tile files are not byte for byte the same (another encoder; the browser
+  also writes an sRGB colour profile into its WebP files). Partly transparent pixels can differ by a step or two, the
+  browser's premultiplied canvas (see the notes); fully opaque and fully transparent pixels are exact.
+- The image is read as a browser shows it: EXIF orientation applied, grey and palette images expanded, a colour
+  profile other than sRGB converted to sRGB, and every fully transparent pixel taken as 0, 0, 0, 0.
+- It needs the decoded image in memory once (width × height × 4 bytes) plus a few hundred MB: a 16384 px square takes
+  about 1.3-1.6 GB and 4-12 s on a 32-core machine. Tiles are encoded in parallel, one thread a core (4 to 32; set
+  `UV_THREADPOOL_SIZE` to change it).
+- Exit codes: 0 done, 1 the image or the folder cannot be used (the message says why), 2 a wrong command line.
+
 ## Notes
 
 - The archive's source hash uses Web Crypto, which browsers only offer to secure pages: open the tool over https (as
@@ -150,12 +182,15 @@ To zoom in past the source's pixels, raise `maxZoom` and keep `maxNativeZoom` at
 ```
 pnpm install
 pnpm dev                    # the site on http://localhost:3000
-pnpm lint                   # eslint src
+pnpm lint                   # eslint src cli
 pnpm exec tsc --noEmit -p .
 pnpm test                   # vitest
 pnpm fixtures [N | WxH]...  # test pattern PNGs in test/fixtures/generated/ (default 1024 and 1632)
+pnpm cut <image> <out_dir>  # the command-line cutter
 ```
 
 The tiling rules are pure modules in `src/services/` (`tile_plan.ts`, `downscale.ts`, `blank_tile.ts`, `preview.ts`,
-`tiles_manifest.ts`); `tile_generator.ts` runs them on canvases in the browser. `src/utils/cut_options.ts` remembers
-the options.
+`tiles_manifest.ts`); `tile_generator.ts` runs them on canvases in the browser, `cli/` with sharp in Node
+(`cut_tiles.ts`, with the pyramid built row by row in `pyramid_stream.ts`). The browser draws only the maximum zoom
+on a canvas; every level below it is halved in memory with the same code as the command line, so both make the same
+pixels. `test/cli_parity.test.ts` checks that tile for tile. `src/utils/cut_options.ts` remembers the options.

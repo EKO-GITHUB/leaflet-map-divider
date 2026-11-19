@@ -22,7 +22,16 @@ interface FakeCanvasLog {
 }
 
 function fake_canvas(log: FakeCanvasLog) {
-  const ctx = { imageSmoothingEnabled: true, drawImage: () => {}, clearRect: () => {} };
+  // every level below the top is read back from the level canvas and halved in memory, then put on the tile canvas
+  const image_data = (width: number, height: number) => ({ width, height, data: new Uint8ClampedArray(width * height * 4) });
+  const ctx = {
+    imageSmoothingEnabled: true,
+    drawImage: () => {},
+    clearRect: () => {},
+    getImageData: (_x: number, _y: number, width: number, height: number) => image_data(width, height),
+    createImageData: image_data,
+    putImageData: () => {}
+  };
   return {
     width: 0,
     height: 0,

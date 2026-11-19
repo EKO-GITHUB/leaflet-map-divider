@@ -1,4 +1,4 @@
-import { DownscaleMode, downscale_2x } from "@/services/downscale";
+import { DownscaleMode, halving_of } from "@/services/downscale";
 import { TilePlan } from "@/services/tile_plan";
 
 // The archive's preview.webp: the image's content area (the top-left width x height of the padded square, never the
@@ -70,28 +70,18 @@ export function crop_top_left(source: Pixels, source_width: number, width: numbe
 
 /**
  * The image at half its size, ceil(width / 2) x ceil(height / 2), as the pyramid would make the next level: an odd
- * side is padded with one transparent column or row first (the pad beyond the content is transparent too). "smooth"
- * is downscale_2x; "pixel" keeps the top-left pixel of each 2x2 cell (nearest-neighbour from the source).
+ * side is padded with one transparent column or row first (the pad beyond the content is transparent too), then the
+ * mode's halving is applied: downscale_2x for "smooth", pick_2x (the top-left pixel of each 2x2 cell) for "pixel".
  */
 export function halve_image(image: RgbaImage, mode: DownscaleMode): RgbaImage {
   const { width, height } = image;
   const out_width = Math.ceil(width / 2);
   const out_height = Math.ceil(height / 2);
-  if (mode === "pixel") {
-    const data = new Uint8ClampedArray(out_width * out_height * 4);
-    for (let y = 0; y < out_height; y++) {
-      for (let x = 0; x < out_width; x++) {
-        const from = (2 * y * width + 2 * x) * 4;
-        data.set(image.data.subarray(from, from + 4), (y * out_width + x) * 4);
-      }
-    }
-    return { data, width: out_width, height: out_height };
-  }
   const even_width = out_width * 2;
   const even_height = out_height * 2;
   const source =
     even_width === width && even_height === height ? image : pad_image(image, even_width, even_height);
-  return { data: downscale_2x(source.data, even_width, even_height), width: out_width, height: out_height };
+  return { data: halving_of(mode)(source.data, even_width, even_height), width: out_width, height: out_height };
 }
 
 function pad_image(image: RgbaImage, width: number, height: number): RgbaImage {

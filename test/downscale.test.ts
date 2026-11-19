@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { average_2x2, DEFAULT_DOWNSCALE_MODE, DOWNSCALE_MODES, downscale_2x, Rgba } from "@/services/downscale";
+import {
+  average_2x2,
+  DEFAULT_DOWNSCALE_MODE,
+  DOWNSCALE_MODES,
+  downscale_2x,
+  DownscaleMode,
+  halving_of,
+  pick_2x,
+  Rgba
+} from "@/services/downscale";
 import { reference_downscale, seeded_rgba } from "./fixtures/downscale_reference";
 
 const RED: Rgba = [255, 0, 0, 255];
@@ -135,5 +144,71 @@ describe("downscale modes", () => {
   it("are pixel and smooth, pixel by default (today's behaviour)", () => {
     expect(DOWNSCALE_MODES).toEqual(["pixel", "smooth"]);
     expect(DEFAULT_DOWNSCALE_MODE).toBe("pixel");
+  });
+});
+
+describe("pick_2x (the pixel halving)", () => {
+  it("keeps the top-left pixel of each 2x2 block, alpha and all", () => {
+    const src = seeded_rgba(6, 4, 21, "random");
+    const out = pick_2x(src, 6, 4);
+    expect(out).toHaveLength(3 * 2 * 4);
+    for (let y = 0; y < 2; y++) {
+      for (let x = 0; x < 3; x++) {
+        const from = (2 * y * 6 + 2 * x) * 4;
+        expect(Array.from(out.subarray((y * 3 + x) * 4, (y * 3 + x) * 4 + 4))).toEqual(Array.from(src.subarray(from, from + 4)));
+      }
+    }
+  });
+
+  it("chained, samples the source at the top left of every cell (x * scale, y * scale)", () => {
+    const size = 64;
+    const src = seeded_rgba(size, size, 22, "sparse");
+    let level: Uint8Array | Uint8ClampedArray = src;
+    for (let k = 1, side = size; k <= 4; k++, side /= 2) {
+      level = pick_2x(level, side, side);
+      const scale = 2 ** k;
+      const half = side / 2;
+      for (let y = 0; y < half; y++) {
+        for (let x = 0; x < half; x++) {
+          const from = (y * scale * size + x * scale) * 4;
+          const at = (y * half + x) * 4;
+          expect(Array.from(level.subarray(at, at + 4)), `${scale}x at ${x},${y}`).toEqual(
+            Array.from(src.subarray(from, from + 4))
+          );
+        }
+      }
+    }
+  });
+
+  it("gives the same result band by band, and from unaligned buffers", () => {
+    const src = seeded_rgba(20, 12, 23, "random");
+    const whole = pick_2x(src, 20, 12);
+    const banded = new Uint8ClampedArray(whole.length);
+    for (let y = 0; y < 12; y += 4) {
+      pick_2x(src.subarray(y * 20 * 4, (y + 4) * 20 * 4), 20, 4, banded.subarray((y / 2) * 10 * 4, ((y + 4) / 2) * 10 * 4));
+    }
+    expect(Buffer.from(banded).equals(Buffer.from(whole))).toBe(true);
+
+    // a subarray at an odd byte offset cannot be read as 32-bit words: the byte path gives the same pixels
+    const shifted = new Uint8Array(src.length + 1);
+    shifted.set(src, 1);
+    const out = new Uint8ClampedArray(whole.length + 1);
+    pick_2x(shifted.subarray(1), 20, 12, out.subarray(1));
+    expect(Buffer.from(out.subarray(1)).equals(Buffer.from(whole))).toBe(true);
+  });
+
+  it("rejects odd, tiny or mismatched sizes, like downscale_2x", () => {
+    const src = new Uint8Array(4 * 4 * 4);
+    expect(() => pick_2x(src, 3, 4)).toThrow(RangeError);
+    expect(() => pick_2x(src, 4, 3)).toThrow(RangeError);
+    expect(() => pick_2x(src, 0, 4)).toThrow(RangeError);
+    expect(() => pick_2x(src, 8, 4)).toThrow(RangeError);
+    expect(() => pick_2x(src, 4, 4, new Uint8ClampedArray(15))).toThrow(RangeError);
+  });
+
+  it("is the halving of pixel mode; downscale_2x is smooth's", () => {
+    expect(halving_of("pixel")).toBe(pick_2x);
+    expect(halving_of("smooth")).toBe(downscale_2x);
+    expect(() => halving_of("nearest" as DownscaleMode)).toThrow(RangeError);
   });
 });

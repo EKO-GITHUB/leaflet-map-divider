@@ -8,13 +8,13 @@ import { DownscaleMode } from "@/services/downscale";
 import { plan_preview, PREVIEW_FILE, PREVIEW_MAX_SIZE } from "@/services/preview";
 import { MANIFEST_FILE, TilesManifest } from "@/services/tiles_manifest";
 import { compare_rgba } from "./fixtures/compare";
-import { AlphaMode, crop, noise_pixel, reference_downscale, reference_pyramid } from "./fixtures/downscale_reference";
+import { crop, reference_downscale, reference_pyramid } from "./fixtures/downscale_reference";
+import { EncodeLog, fake_canvas, FakeImage, noise_image, pattern_image, Sampler, TRANSPARENT } from "./fixtures/fake_canvas";
 import { FIXTURE_PATTERNS, pattern_spec, PatternSpec, render_pattern, write_pattern_pixel } from "./fixtures/pattern";
-import { decode_png, encode_png } from "./fixtures/png";
+import { decode_png } from "./fixtures/png";
 
-// The checker test: a fake canvas that really holds the pattern's pixels (nearest-neighbour, as the browser draws with
-// imageSmoothingEnabled off) and encodes PNG with the fixtures' encoder, so every tile in the zip can be decoded and
-// compared with the pattern region it must hold.
+// The checker test: a fake canvas (fixtures/fake_canvas.ts) that really holds the pattern's pixels and encodes PNG with
+// the fixtures' encoder, so every tile in the zip can be decoded and compared with the pattern region it must hold.
 
 // every cut hashes its source file for tiles.json; the fake source's bytes do not matter to the tiles
 const SOURCE_FILE = new Blob(["fake source image"]);
@@ -22,158 +22,6 @@ const SOURCE_FILE = new Blob(["fake source image"]);
 const PREVIEW_ENCODES = 1;
 const TILE_NAME = /^\d+\/\d+\/\d+\.(png|webp)$/;
 
-type Sampler = (x: number, y: number, out: Uint8Array | Uint8ClampedArray, offset: number) => void;
-
-const TRANSPARENT: Sampler = (_x, _y, out, offset) => out.fill(0, offset, offset + 4);
-
-// a source image: its size and its pixel at (x, y)
-interface FakeImage {
-  naturalWidth: number;
-  naturalHeight: number;
-  write: Sampler;
-}
-
-function pattern_image(spec: PatternSpec): FakeImage {
-  return {
-    naturalWidth: spec.width,
-    naturalHeight: spec.height,
-    write: (x, y, out, offset) => write_pattern_pixel(spec, x, y, out, offset)
-  };
-}
-
-function noise_image(size: number, seed: number, alpha: AlphaMode): FakeImage {
-  return {
-    naturalWidth: size,
-    naturalHeight: size,
-    write: (x, y, out, offset) => noise_pixel(x, y, seed, alpha, out, offset)
-  };
-}
-
-interface FakeImageData {
-  width: number;
-  height: number;
-  data: Uint8ClampedArray;
-}
-
-interface FakeCanvas {
-  width: number;
-  height: number;
-  sampler: Sampler;
-  getContext: () => unknown;
-  toBlob: (callback: (blob: Blob | null) => void, type?: string, quality?: number) => void;
-}
-
-interface EncodeLog {
-  // every encode in call order: its bytes, mime type and quality
-  encodes: { bytes: Uint8Array; type?: string; quality?: number }[];
-  in_flight: number;
-  max_in_flight: number;
-  // returns true to make that encode fail (toBlob hands back null)
-  fail?: (index: number) => boolean;
-  // every getImageData call: the canvas size and the band read
-  reads: { canvas_size: number; y: number; rows: number }[];
-  // called on each getImageData, so a test can abort while a level is being downscaled
-  on_read?: (count: number) => void;
-}
-
-function fake_canvas(log: EncodeLog): FakeCanvas {
-  let width = 0;
-  let height = 0;
-  const canvas: FakeCanvas = {
-    // a size change clears the canvas, as in the browser
-    get width() {
-      return width;
-    },
-    set width(value: number) {
-      width = value;
-      canvas.sampler = TRANSPARENT;
-    },
-    get height() {
-      return height;
-    },
-    set height(value: number) {
-      height = value;
-      canvas.sampler = TRANSPARENT;
-    },
-    sampler: TRANSPARENT,
-    getContext: () => ctx,
-    toBlob: (callback, type, quality) => {
-      const index = log.encodes.length;
-      // toBlob copies the bitmap when it is called: render now, deliver later
-      const rgba = new Uint8Array(width * height * 4);
-      for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) canvas.sampler(x, y, rgba, (y * width + x) * 4);
-      }
-      const bytes = new Uint8Array(encode_png(width, height, rgba));
-      log.encodes.push({ bytes, type, quality });
-      log.in_flight++;
-      log.max_in_flight = Math.max(log.max_in_flight, log.in_flight);
-      const failed = log.fail?.(index) ?? false;
-      // uneven delays, so the encodes finish out of order
-      setTimeout(() => {
-        log.in_flight--;
-        callback(failed ? null : new Blob([bytes], { type }));
-      }, (index * 7) % 5);
-    }
-  };
-
-  const ctx = {
-    imageSmoothingEnabled: true,
-    clearRect: () => {
-      canvas.sampler = TRANSPARENT;
-    },
-    // getImageData(x, y, w, h): the pixels as the canvas holds them (this fake stores them exactly, a browser canvas
-    // stores premultiplied colour)
-    getImageData: (sx: number, sy: number, w: number, h: number): FakeImageData => {
-      log.reads.push({ canvas_size: width, y: sy, rows: h });
-      log.on_read?.(log.reads.length);
-      const data = new Uint8ClampedArray(w * h * 4);
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) canvas.sampler(sx + x, sy + y, data, (y * w + x) * 4);
-      }
-      return { width: w, height: h, data };
-    },
-    createImageData: (w: number, h: number): FakeImageData => ({
-      width: w,
-      height: h,
-      data: new Uint8ClampedArray(w * h * 4)
-    }),
-    // putImageData(data, 0, 0): replaces the pixels with a copy (later changes to the ImageData do not show)
-    putImageData: (image_data: FakeImageData, dx: number, dy: number) => {
-      if (dx !== 0 || dy !== 0) throw new Error("the fake only puts image data at 0, 0");
-      const copy = image_data.data.slice();
-      const w = image_data.width;
-      const h = image_data.height;
-      canvas.sampler = (x, y, out, offset) => {
-        if (x >= w || y >= h) return TRANSPARENT(x, y, out, offset);
-        const i = (y * w + x) * 4;
-        out[offset] = copy[i];
-        out[offset + 1] = copy[i + 1];
-        out[offset + 2] = copy[i + 2];
-        out[offset + 3] = copy[i + 3];
-      };
-    },
-    drawImage: (source: FakeImage | FakeCanvas, ...args: number[]) => {
-      if ("write" in source) {
-        // drawImage(image, dx, dy, dw, dh) or drawImage(image, sx, sy, sw, sh, dx, dy, dw, dh), always from 0,0
-        const [dw, dh] = args.length === 4 ? [args[2], args[3]] : [args[6], args[7]];
-        const scale_x = source.naturalWidth / dw;
-        const scale_y = source.naturalHeight / dh;
-        const write = source.write;
-        canvas.sampler = (x, y, out, offset) => {
-          if (x >= dw || y >= dh) return TRANSPARENT(x, y, out, offset);
-          write(Math.floor(x * scale_x), Math.floor(y * scale_y), out, offset);
-        };
-      } else {
-        // drawImage(canvas, sx, sy, w, h, 0, 0, w, h): a 1:1 copy of a region
-        const [sx, sy] = args;
-        const from = source.sampler;
-        canvas.sampler = (x, y, out, offset) => from(sx + x, sy + y, out, offset);
-      }
-    }
-  };
-  return canvas;
-}
 
 function valid_plan(width: number, height: number): TilePlan {
   const result = plan_tiles(width, height);
@@ -473,16 +321,47 @@ describe("smooth downscale", () => {
     expect(changed.length).toBeGreaterThan(0);
   });
 
-  it("leaves pixel mode as it was when the option is left out", async () => {
+  it("uses pixel mode when the option is left out", async () => {
     const spec = FIXTURE_PATTERNS[0];
     const by_default = tile_entries((await cut(spec)).bytes);
     log = { encodes: [], in_flight: 0, max_in_flight: 0, reads: [] };
     const pixel = tile_entries((await cut(spec, "png", "pixel")).bytes);
     expect(pixel.map(entry => entry.name)).toEqual(by_default.map(entry => entry.name));
     pixel.forEach((entry, i) => expect(Buffer.from(entry.data).equals(Buffer.from(by_default[i].data))).toBe(true));
-    // pixel mode never reads the canvas back
-    expect(log.reads).toHaveLength(0);
+    // pixel mode, like smooth, reads the top level back once and halves it in memory (pick_2x, not canvas draws)
+    expect(log.reads).toEqual([{ canvas_size: 1024, y: 0, rows: 1024 }]);
   });
+
+  it("reads the canvas once in pixel mode too, and picks the top-left pixel of each cell", async () => {
+    const image = noise_image(4096, 4, "random");
+    const { plan, bytes } = await cut_image(image, "noise-4096.png", "png", "pixel");
+
+    expect(log.reads.map(read => [read.canvas_size, read.y, read.rows])).toEqual([
+      [4096, 0, 1024],
+      [4096, 1024, 1024],
+      [4096, 2048, 1024],
+      [4096, 3072, 1024]
+    ]);
+    // every pixel of z0-z2 is the source pixel at the top left of its cell (no seams between the bands)
+    const tiles = await decoded_tiles(bytes, plan);
+    const source = render_image(image);
+    const t = plan.tile_size;
+    for (const level of plan.levels.slice(0, 3)) {
+      for (let y = 0; y < level.tiles_per_side; y++) {
+        for (let x = 0; x < level.tiles_per_side; x++) {
+          const expected = new Uint8Array(t * t * 4);
+          for (let py = 0; py < t; py++) {
+            for (let px = 0; px < t; px++) {
+              const from = (((y * t + py) * level.scale) * 4096 + (x * t + px) * level.scale) * 4;
+              expected.set(source.subarray(from, from + 4), (py * t + px) * 4);
+            }
+          }
+          const name = `${level.zoom}/${y}/${x}.png`;
+          expect(compare_rgba(tiles.get(name)!, expected, t).first_mismatch, name).toBeNull();
+        }
+      }
+    }
+  }, 60_000);
 
   it("reads the canvas once, the top level, in even bands", async () => {
     const image = noise_image(4096, 3, "opaque");
@@ -600,24 +479,21 @@ describe("skip blank tiles", () => {
     log = { encodes: [], in_flight: 0, max_in_flight: 0, reads: [] };
     const { plan, bytes } = await cut(spec);
     expect(tile_entries(bytes).filter(entry => !entry.name.endsWith("/"))).toHaveLength(plan.total_tiles);
-    // the tile canvas is never read back
-    expect(log.reads).toHaveLength(0);
+    // the tile canvas is never read back; the level canvas once, to halve it, not to find blank tiles
+    expect(log.reads).toEqual([{ canvas_size: 1024, y: 0, rows: 1024 }]);
   });
 
-  it("reads each drawn level once to find its blank tiles, never a tile on its own", async () => {
-    const spec = FIXTURE_PATTERNS[0];
-    await cut_skipping(spec, "pixel", true);
-    // pixel mode draws every level from the image: one read of each whole level (1024 px levels fit in one band)
-    expect(log.reads).toEqual([1024, 512, 256, 128].map(size => ({ canvas_size: size, y: 0, rows: size })));
-
-    log = { encodes: [], in_flight: 0, max_in_flight: 0, reads: [] };
-    await cut_skipping(spec, "smooth", true);
-    // smooth draws only the top level: read for its blank tiles, then for the downscale; the levels below are in memory
-    expect(log.reads).toEqual([
-      { canvas_size: 1024, y: 0, rows: 1024 },
-      { canvas_size: 1024, y: 0, rows: 1024 }
-    ]);
-  });
+  it.each(["pixel", "smooth"] as const)(
+    "reads the drawn level once to find its blank tiles, never a tile on its own (%s)",
+    async downscale => {
+      await cut_skipping(FIXTURE_PATTERNS[0], downscale, true);
+      // only the top level is drawn: read for its blank tiles, then to halve it; the levels below are in memory
+      expect(log.reads).toEqual([
+        { canvas_size: 1024, y: 0, rows: 1024 },
+        { canvas_size: 1024, y: 0, rows: 1024 }
+      ]);
+    }
+  );
 
   it("finds blank tiles across the bands of a large level", async () => {
     // opaque noise with a transparent stripe over the tile rows 7 and 8 of z5 (source rows 896-1151), across the
@@ -640,8 +516,10 @@ describe("skip blank tiles", () => {
     });
     const names = new Set(tile_entries(new Uint8Array(await blob.arrayBuffer())).map(entry => entry.name));
 
+    // the read for the blank tiles, then the read to halve the level
     const top = log.reads.filter(read => read.canvas_size === 4096);
-    expect(top.map(read => [read.y, read.rows])).toEqual([[0, 1024], [1024, 1024], [2048, 1024], [3072, 1024]]);
+    const bands = [[0, 1024], [1024, 1024], [2048, 1024], [3072, 1024]];
+    expect(top.map(read => [read.y, read.rows])).toEqual([...bands, ...bands]);
     const final = progress[progress.length - 1];
     // only z5 has whole tiles inside the stripe: 2 rows of 32
     expect(final.skipped_tiles).toBe(64);
