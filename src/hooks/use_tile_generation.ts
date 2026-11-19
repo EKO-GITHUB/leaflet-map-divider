@@ -3,6 +3,7 @@ import { MapImage, OutputFormat, TileGenerationProgress } from "@/types/types";
 import { download_zip_file, generate_tiles } from "@/services/tile_generator";
 import { DEFAULT_DOWNSCALE_MODE, DownscaleMode } from "@/services/downscale";
 import { DEFAULT_SKIP_BLANK } from "@/services/blank_tile";
+import { DEFAULT_TILE_SIZE_MODE, TilePlan, TileSizeMode } from "@/services/tile_plan";
 
 export function useTileGeneration() {
   const [is_generating, set_is_generating] = useState(false);
@@ -19,6 +20,7 @@ export function useTileGeneration() {
   const [output_format, set_output_format] = useState<OutputFormat>("png");
   const [downscale_mode, set_downscale_mode] = useState<DownscaleMode>(DEFAULT_DOWNSCALE_MODE);
   const [skip_blank, set_skip_blank] = useState(DEFAULT_SKIP_BLANK);
+  const [tile_size_mode, set_tile_size_mode] = useState<TileSizeMode>(DEFAULT_TILE_SIZE_MODE);
 
   // the running cut's controller; null when no cut runs
   const controller_ref = useRef<AbortController | null>(null);
@@ -39,7 +41,8 @@ export function useTileGeneration() {
     set_error(null);
   }, []);
 
-  const generate_tiles_handler = useCallback(async (image: MapImage) => {
+  // plan: the image's plan under tile_size_mode (the caller derives it, so the UI and the cut read the same numbers)
+  const generate_tiles_handler = useCallback(async (image: MapImage, plan: TilePlan) => {
     controller_ref.current?.abort();
     const controller = new AbortController();
     const { signal } = controller;
@@ -51,7 +54,7 @@ export function useTileGeneration() {
     try {
       const blob = await generate_tiles({
         image: image.element,
-        plan: image.plan,
+        plan,
         output_format,
         downscale: downscale_mode,
         skip_blank,
@@ -101,6 +104,8 @@ export function useTileGeneration() {
     set_downscale_mode,
     skip_blank,
     set_skip_blank,
+    tile_size_mode,
+    set_tile_size_mode,
     generate_tiles: generate_tiles_handler,
     cancel_generation,
     reset_error: () => set_error(null)

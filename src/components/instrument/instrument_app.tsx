@@ -1,11 +1,11 @@
 "use client";
 
-import React, { useRef, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useImageUpload } from "@/hooks/use_image_upload";
 import { useTileGeneration } from "@/hooks/use_tile_generation";
 import { useEta } from "@/hooks/use_eta";
-import { plan_level } from "@/services/tile_plan";
+import { is_padded, plan_level, require_plan, TilePlan } from "@/services/tile_plan";
 import { CutViewport } from "./cut_viewport";
 
 function RailSection({ index, title, delay, children }: {
@@ -71,6 +71,11 @@ const DOWNSCALE_OPTIONS = [
   { value: "smooth", label: "SMOOTH" }
 ] as const;
 
+const TILE_SIZE_OPTIONS = [
+  { value: "auto", label: "AUTO" },
+  { value: "256", label: "256" }
+] as const;
+
 const BLANK_TILE_OPTIONS = [
   { value: "skip", label: "SKIP" },
   { value: "keep", label: "KEEP" }
@@ -78,6 +83,12 @@ const BLANK_TILE_OPTIONS = [
 
 function plural_tiles(count: number) {
   return `${count.toLocaleString()} blank tile${count === 1 ? "" : "s"}`;
+}
+
+// tiles of a zoom level that hold image pixels (the others are only the pad)
+function content_tiles(plan: TilePlan, zoom: number) {
+  const level = plan_level(plan, zoom);
+  return level.content_columns * level.content_rows;
 }
 
 function DataRow({ label, children }: {
@@ -111,6 +122,8 @@ export function InstrumentApp() {
     set_downscale_mode,
     skip_blank,
     set_skip_blank,
+    tile_size_mode,
+    set_tile_size_mode,
     generate_tiles,
     cancel_generation,
     reset_error
@@ -123,13 +136,21 @@ export function InstrumentApp() {
   const [saved_skipped, set_saved_skipped] = useState(0);
   const eta = useEta(is_generating, progress);
 
+  // the image's tiling plan under the chosen tile size; the grid, the numbers and the cut all read it
+  const plan = useMemo(
+    () => (selected_image ? require_plan(selected_image.width, selected_image.height, { tile_size: tile_size_mode }) : null),
+    [selected_image, tile_size_mode]
+  );
+  // a tile size with fewer zoom levels keeps the preview inside the plan
+  const shown_zoom = plan ? Math.min(preview_zoom, plan.max_zoom) : 0;
+
   const [previewed_image, set_previewed_image] = useState(selected_image);
   const [seen_stage, set_seen_stage] = useState(progress.current_stage);
 
   // state adjusted while rendering when its inputs change, not in an effect
   if (previewed_image !== selected_image) {
     set_previewed_image(selected_image);
-    set_preview_zoom(selected_image ? Math.min(1, selected_image.plan.max_zoom) : 0);
+    set_preview_zoom(plan ? Math.min(1, plan.max_zoom) : 0);
   }
 
   if (seen_stage !== progress.current_stage) {
@@ -149,9 +170,9 @@ export function InstrumentApp() {
   };
 
   const handle_generate = () => {
-    if (!selected_image) return;
+    if (!selected_image || !plan) return;
     set_has_saved(false);
-    generate_tiles(selected_image);
+    generate_tiles(selected_image, plan);
   };
 
   // an abort during the zip step comes after the "complete" stage, so the saved notice is cleared here
@@ -160,8 +181,8 @@ export function InstrumentApp() {
     cancel_generation();
   };
 
-  const can_generate = !!selected_image && selected_image.plan.max_zoom > 0;
-  const total_tiles = selected_image ? selected_image.plan.total_tiles : 0;
+  const can_generate = !!plan && plan.max_zoom > 0;
+  const total_tiles = plan ? plan.total_tiles : 0;
   const show_saved = has_saved && !is_generating && !generation_error;
 
   return (
@@ -214,15 +235,18 @@ export function InstrumentApp() {
           </div>
 
           <RailSection index="01" title="SOURCE" delay={80}>
-            {selected_image ? (
+            {selected_image && plan ? (
               <>
                 <DataRow label="File">{selected_image.file_name}</DataRow>
                 <DataRow label="Size">{selected_image.width} × {selected_image.height} px</DataRow>
+                <DataRow label="Padded to">
+                  {is_padded(plan) ? `${plan.padded_size} × ${plan.padded_size} px` : "—"}
+                </DataRow>
                 <DataRow label="Max zoom">
-                  <span className="text-[var(--c-acc)]">z{selected_image.plan.max_zoom}</span>
+                  <span className="text-[var(--c-acc)]">z{plan.max_zoom}</span>
                 </DataRow>
                 <DataRow label="Tile at max">
-                  {selected_image.plan.tile_size} px
+                  {plan.tile_size} px
                 </DataRow>
                 <button
                   onClick={handle_eject}
@@ -249,16 +273,16 @@ export function InstrumentApp() {
           </RailSection>
 
           <RailSection index="02" title="CUT GRID" delay={160}>
-            {selected_image ? (
+            {plan ? (
               <>
                 <div className="flex flex-wrap gap-1.5">
-                  {Array.from({ length: selected_image.plan.max_zoom + 1 }, (_, z) => (
+                  {Array.from({ length: plan.max_zoom + 1 }, (_, z) => (
                     <button
                       key={z}
                       onClick={() => set_preview_zoom(z)}
                       disabled={is_generating}
                       className={`data border px-3 py-1.5 text-[12px] transition-colors disabled:opacity-40 ${
-                        z === preview_zoom
+                        z === shown_zoom
                           ? "border-[var(--c-acc)] bg-[var(--c-acc)] font-semibold text-black"
                           : "border-[var(--c-line)] text-[var(--c-dim)] hover:border-[var(--c-dim)] hover:text-[var(--c-text)]"
                       }`}
@@ -273,16 +297,25 @@ export function InstrumentApp() {
                   ) : (
                     <>
                       <span className="data text-[var(--c-text)]">
-                        {Math.pow(2, preview_zoom)}×{Math.pow(2, preview_zoom)}
+                        {Math.pow(2, shown_zoom)}×{Math.pow(2, shown_zoom)}
                       </span>{" "}
                       grid ·{" "}
                       <span className="data text-[var(--c-text)]">
-                        {Math.pow(4, preview_zoom).toLocaleString()}
+                        {Math.pow(4, shown_zoom).toLocaleString()}
                       </span>{" "}
                       tiles of{" "}
                       <span className="data text-[var(--c-text)]">
-                        {plan_level(selected_image.plan, preview_zoom).source_tile_size}px
+                        {plan_level(plan, shown_zoom).source_tile_size}px
                       </span>
+                      {is_padded(plan) && (
+                        <>
+                          {" · "}
+                          <span className="data text-[var(--c-text)]">
+                            {content_tiles(plan, shown_zoom).toLocaleString()}
+                          </span>{" "}
+                          hold the image
+                        </>
+                      )}
                       <br />
                       Scroll on the viewport to change z · click a cell to
                       view that tile full-size
@@ -315,6 +348,18 @@ export function InstrumentApp() {
                   downscale_mode === "pixel"
                     ? "Nearest pixel — keeps pixel art sharp"
                     : "2×2 average — for painted and 3D maps"
+                }
+              />
+              <ChoiceGroup
+                label="TILE SIZE"
+                options={TILE_SIZE_OPTIONS}
+                value={tile_size_mode}
+                on_change={set_tile_size_mode}
+                disabled={is_generating}
+                hint={
+                  tile_size_mode === "auto"
+                    ? "Halves the image while its side is even"
+                    : "256 px tiles — pads to a 256 × 2ⁿ square"
                 }
               />
               <ChoiceGroup
@@ -447,11 +492,12 @@ export function InstrumentApp() {
 
         <CutViewport
           image={selected_image}
+          plan={plan}
           upload_error={upload_error}
           is_uploading={is_uploading}
           on_files={handle_image_upload}
           input_ref={input_ref}
-          zoom={preview_zoom}
+          zoom={shown_zoom}
           on_zoom_change={set_preview_zoom}
           is_generating={is_generating}
           progress={progress}

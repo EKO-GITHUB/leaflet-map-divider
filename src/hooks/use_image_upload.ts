@@ -55,8 +55,7 @@ export function useImageUpload() {
         width: validation.plan.width,
         height: validation.plan.height,
         file_name: file.name,
-        src: img.src,
-        plan: validation.plan
+        src: img.src
       };
 
       set_selected_image(new_image);

@@ -1,12 +1,12 @@
 import JSZip from "jszip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { generate_tiles, MAX_PENDING_ENCODES } from "@/services/tile_generator";
-import { plan_tiles, TilePlan } from "@/services/tile_plan";
+import { is_padded, plan_tiles, require_plan, TILE_SIZE_MODES, TilePlan, TileSizeMode } from "@/services/tile_plan";
 import { OutputFormat, TileGenerationProgress } from "@/types/types";
 import { DownscaleMode } from "@/services/downscale";
 import { compare_rgba } from "./fixtures/compare";
 import { AlphaMode, crop, noise_pixel, reference_pyramid } from "./fixtures/downscale_reference";
-import { FIXTURE_PATTERNS, PatternSpec, render_pattern, write_pattern_pixel } from "./fixtures/pattern";
+import { FIXTURE_PATTERNS, pattern_spec, PatternSpec, render_pattern, write_pattern_pixel } from "./fixtures/pattern";
 import { decode_png, encode_png } from "./fixtures/png";
 
 // The checker test: a fake canvas that really holds the pattern's pixels (nearest-neighbour, as the browser draws with
@@ -676,5 +676,165 @@ describe("skip blank tiles", () => {
     expect(log.encodes).toHaveLength(0);
     // a yield every 10 tiles (85 tiles: 8), plus one per downscale band (3 levels)
     expect(channel_spy.mock.calls.length).toBeGreaterThanOrEqual(8);
+  });
+});
+
+describe("non-square images and tile size 256", () => {
+  // 1200 x 800: the transparent corner (200 px) is at the image's own bottom right, inside the content
+  const SPEC = pattern_spec(1200, 800);
+
+  // the padded square as the generator sees it: the pattern at the top left, alpha 0 everywhere else
+  function padded_sampler(spec: PatternSpec): Sampler {
+    return (x, y, out, offset) =>
+      x < spec.width && y < spec.height ? write_pattern_pixel(spec, x, y, out, offset) : TRANSPARENT(x, y, out, offset);
+  }
+
+  function render_padded(spec: PatternSpec, size: number) {
+    const sample = padded_sampler(spec);
+    const data = new Uint8ClampedArray(size * size * 4);
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) sample(x, y, data, (y * size + x) * 4);
+    }
+    return data;
+  }
+
+  // every tile of the plan as it must come out: pixel mode samples the top left of each source cell (the whole region
+  // at the top zoom), smooth mode is the reference pyramid of the padded square
+  function expected_tiles(spec: PatternSpec, plan: TilePlan, downscale: DownscaleMode) {
+    const t = plan.tile_size;
+    const tiles = new Map<string, Uint8Array>();
+    const pyramid = downscale === "smooth" ? reference_pyramid(render_padded(spec, plan.padded_size), plan.padded_size, plan.max_zoom) : null;
+    const sample = padded_sampler(spec);
+    for (const level of plan.levels) {
+      for (let y = 0; y < level.tiles_per_side; y++) {
+        for (let x = 0; x < level.tiles_per_side; x++) {
+          let tile: Uint8Array;
+          if (pyramid) {
+            tile = crop(pyramid[plan.max_zoom - level.zoom], x, y, t);
+          } else {
+            tile = new Uint8Array(t * t * 4);
+            for (let py = 0; py < t; py++) {
+              for (let px = 0; px < t; px++) {
+                sample((x * t + px) * level.scale, (y * t + py) * level.scale, tile, (py * t + px) * 4);
+              }
+            }
+          }
+          tiles.set(`${level.zoom}/${y}/${x}`, tile);
+        }
+      }
+    }
+    return tiles;
+  }
+
+  const is_all_transparent = (rgba: Uint8Array) => rgba.every((value, i) => i % 4 !== 3 || value === 0);
+
+  async function cut_padded(spec: PatternSpec, tile_size: TileSizeMode, downscale: DownscaleMode, skip_blank: boolean) {
+    const plan = require_plan(spec.width, spec.height, { tile_size });
+    const progress: TileGenerationProgress[] = [];
+    const blob = await generate_tiles({
+      image: pattern_image(spec) as unknown as HTMLImageElement,
+      plan,
+      output_format: "png",
+      downscale,
+      skip_blank,
+      file_name: `${spec.name}.png`,
+      on_progress: next => progress.push(structuredClone(next))
+    });
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const zip = await JSZip.loadAsync(bytes);
+    const tiles = new Map<string, Uint8Array>();
+    for (const file of Object.values(zip.files)) {
+      if (file.dir) continue;
+      const tile = decode_png(await file.async("uint8array"));
+      expect(tile.width, file.name).toBe(plan.tile_size);
+      expect(tile.height, file.name).toBe(plan.tile_size);
+      tiles.set(file.name.replace(/\.png$/, ""), tile.data);
+    }
+    return { plan, tiles, final: progress[progress.length - 1] };
+  }
+
+  describe.each(["pixel", "smooth"] as const)("%s downscale", downscale => {
+    it.each(TILE_SIZE_MODES)("cuts 1200x800 at tile size %s with the image at the top left of the pad", async tile_size => {
+      const { plan, tiles } = await cut_padded(SPEC, tile_size, downscale, false);
+      const expected = expected_tiles(SPEC, plan, downscale);
+
+      // every tile is written when nothing is skipped, and holds its part of the padded square
+      expect(tiles.size).toBe(plan.total_tiles);
+      for (const [name, tile] of expected) {
+        const result = compare_rgba(tiles.get(name)!, tile, plan.tile_size, { compare_transparent_rgb: downscale === "smooth" });
+        expect(result.first_mismatch, name).toBeNull();
+      }
+      // tiles past the image's columns and rows are pad alone: fully transparent
+      for (const level of plan.levels) {
+        for (let y = 0; y < level.tiles_per_side; y++) {
+          for (let x = 0; x < level.tiles_per_side; x++) {
+            if (x < level.content_columns && y < level.content_rows) continue;
+            expect(is_all_transparent(tiles.get(`${level.zoom}/${y}/${x}`)!), `${level.zoom}/${y}/${x}`).toBe(true);
+          }
+        }
+      }
+    });
+
+    it.each(TILE_SIZE_MODES)("skips the blank pad tiles of 1200x800 at tile size %s", async tile_size => {
+      const { plan, tiles, final } = await cut_padded(SPEC, tile_size, downscale, true);
+      const expected = expected_tiles(SPEC, plan, downscale);
+      const blank = [...expected].filter(([, tile]) => is_all_transparent(tile)).map(([name]) => name);
+
+      expect([...tiles.keys()].sort()).toEqual([...expected.keys()].filter(name => !blank.includes(name)).sort());
+      for (const [name, tile] of tiles) {
+        const result = compare_rgba(tile, expected.get(name)!, plan.tile_size, { compare_transparent_rgb: downscale === "smooth" });
+        expect(result.first_mismatch, name).toBeNull();
+      }
+      expect(final.skipped_tiles).toBe(blank.length);
+      expect(final.processed_tiles).toBe(plan.total_tiles);
+      expect(log.encodes).toHaveLength(plan.total_tiles - blank.length);
+    });
+  });
+
+  it("leaves out exactly the pad tiles and the corner tile at tile size 256", async () => {
+    // 2048 px square, 256 px tiles. z3: the image spans 5 x 4 tiles, and the tile 4,3 (x 1024-1279, y 768-1023) holds
+    // only the transparent corner (x >= 1000, y >= 600) and pad, so 19 of 64 are written; z2: 3 x 2; z1: 2 x 1; z0: 1
+    const { plan, tiles, final } = await cut_padded(SPEC, "256", "pixel", true);
+    expect(plan.padded_size).toBe(2048);
+    const by_zoom = (zoom: number) => [...tiles.keys()].filter(name => name.startsWith(`${zoom}/`)).length;
+    expect([0, 1, 2, 3].map(by_zoom)).toEqual([1, 2, 6, 19]);
+    expect(tiles.has("3/3/4")).toBe(false);
+    expect(tiles.has("3/3/3")).toBe(true);
+    expect(tiles.has("3/2/4")).toBe(true);
+    const skipped_by_zoom = Object.fromEntries(
+      final.zoom_levels_progress.map(row => [row.zoom_level, row.skipped_tiles_in_level])
+    );
+    expect(skipped_by_zoom).toEqual({ 3: 45, 2: 10, 1: 2, 0: 0 });
+    expect(final.skipped_tiles).toBe(57);
+  });
+
+  it("cuts an even square at tile size auto exactly as before", async () => {
+    // the 1024 fixture is not padded: the same plan, so the same tiles as every earlier cut
+    const spec = FIXTURE_PATTERNS[0];
+    const plan = require_plan(spec.width, spec.height, { tile_size: "auto" });
+    expect(plan).toEqual(valid_plan(spec.width, spec.height));
+    expect(is_padded(plan)).toBe(false);
+  });
+
+  it("cuts the 1024 fixture into 256 px tiles at tile size 256 (z0-z2, no pad)", async () => {
+    const spec = FIXTURE_PATTERNS[0];
+    const { plan, tiles } = await cut_padded(spec, "256", "pixel", false);
+    expect(plan).toMatchObject({ padded_size: 1024, tile_size: 256, max_zoom: 2, total_tiles: 21 });
+    expect(tiles.size).toBe(21);
+    for (const [name, tile] of expected_tiles(spec, plan, "pixel")) {
+      expect(compare_rgba(tiles.get(name)!, tile, 256).first_mismatch, name).toBeNull();
+    }
+  });
+
+  it("pads an odd-sized image (1001x700 at 256 and auto)", async () => {
+    const spec = pattern_spec(1001, 700);
+    for (const tile_size of TILE_SIZE_MODES) {
+      log = { encodes: [], in_flight: 0, max_in_flight: 0, reads: [] };
+      const { plan, tiles } = await cut_padded(spec, tile_size, "pixel", false);
+      expect(plan.padded_size).toBe(tile_size === "256" ? 1024 : 1002);
+      for (const [name, tile] of expected_tiles(spec, plan, "pixel")) {
+        expect(compare_rgba(tiles.get(name)!, tile, plan.tile_size).first_mismatch, `${tile_size} ${name}`).toBeNull();
+      }
+    }
   });
 });

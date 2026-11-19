@@ -1,5 +1,3 @@
-import type { TilePlan } from "@/services/tile_plan";
-
 export interface ZoomLevelProgress {
   zoom_level: number;
   total_tiles_in_level: number;
@@ -30,5 +28,4 @@ export interface MapImage {
   height: number;
   file_name: string;
   src: string;
-  plan: TilePlan;
 }

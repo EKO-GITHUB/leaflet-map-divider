@@ -2,6 +2,54 @@
 
 import React, { useEffect, useEffectEvent, useRef, useState } from "react";
 import { MapImage, TileGenerationProgress } from "@/types/types";
+import type { TilePlan } from "@/services/tile_plan";
+
+const VIEWPORT_BG = "#070a0f";
+const PAD_HATCH = "rgba(150,190,230,0.2)";
+
+// the pad of the padded square (right of and below the image), hatched; content_* are the image's share of the side
+function PadHatch({ content_width, content_height }: { content_width: number; content_height: number }) {
+  if (content_width >= 1 && content_height >= 1) return null;
+  const w = `${content_width * 100}%`;
+  const h = `${content_height * 100}%`;
+  return (
+    <div
+      data-pad-hatch=""
+      className="pointer-events-none absolute inset-0"
+      style={{
+        clipPath: `polygon(${w} 0, 100% 0, 100% 100%, 0 100%, 0 ${h}, ${w} ${h})`,
+        backgroundColor: "rgba(7,10,15,0.88)",
+        backgroundImage: `repeating-linear-gradient(135deg, ${PAD_HATCH} 0 1px, transparent 1px 9px)`
+      }}
+    />
+  );
+}
+
+// hatches the pad part of an inspected tile drawn on a size x size canvas; right and bottom are where the image ends,
+// in canvas px from the tile's top left
+function paint_pad(ctx: CanvasRenderingContext2D, size: number, right: number, bottom: number) {
+  if (right >= size && bottom >= size) return;
+  const content_right = Math.min(Math.max(right, 0), size);
+  const content_bottom = Math.min(Math.max(bottom, 0), size);
+  const step = Math.max(6, Math.round(size / 48));
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, size, size);
+  if (content_right > 0 && content_bottom > 0) ctx.rect(0, 0, content_right, content_bottom);
+  ctx.clip("evenodd");
+  ctx.fillStyle = VIEWPORT_BG;
+  ctx.fillRect(0, 0, size, size);
+  ctx.strokeStyle = PAD_HATCH;
+  ctx.lineWidth = Math.max(1, step / 9);
+  ctx.beginPath();
+  // rising lines, as the CSS hatch of the grid view
+  for (let d = -size; d < size; d += step) {
+    ctx.moveTo(d, size);
+    ctx.lineTo(d + size, 0);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
 
 function CutGrid({ n, filled, hover }: {
   n: number;
@@ -71,6 +119,7 @@ function Readout({ className, children }: {
 
 export function CutViewport({
                               image,
+                              plan,
                               upload_error,
                               is_uploading,
                               on_files,
@@ -81,6 +130,8 @@ export function CutViewport({
                               progress
                             }: {
   image: MapImage | null;
+  // the image's tiling plan (null without an image): the viewport frame is its padded square
+  plan: TilePlan | null;
   upload_error: string | null;
   is_uploading: boolean;
   on_files: (files: FileList | null) => void;
@@ -105,7 +156,8 @@ export function CutViewport({
 
   const displayed_zoom = is_generating ? progress.current_zoom_level : zoom;
   const n = Math.pow(2, displayed_zoom);
-  const tile_px = image ? Math.round(image.plan.padded_size / n) : 0;
+  const padded_size = plan?.padded_size ?? 0;
+  const tile_px = Math.round(padded_size / n);
   const zoom_row = progress.zoom_levels_progress.find(z => z.zoom_level === displayed_zoom);
   const filled = is_generating && zoom_row ? zoom_row.processed_tiles_in_level : 0;
 
@@ -136,15 +188,18 @@ export function CutViewport({
     };
   }, []);
 
-  // decode the source once into a small proxy, off the interaction path, so
-  // opening a tile never has to re-decode the full-resolution image
+  // decode the source once into a small proxy of the padded square (the image at its top left, the pad transparent),
+  // off the interaction path, so opening a tile never has to re-decode the full-resolution image
   useEffect(() => {
     proxy_ref.current = null;
-    if (!image) return;
+    if (!image || !padded_size) return;
     let cancelled = false;
 
     const build = async () => {
-      const size = Math.min(2048, image.element.naturalWidth);
+      const size = Math.min(2048, padded_size);
+      const ratio = size / padded_size;
+      const width = Math.max(1, Math.round(image.width * ratio));
+      const height = Math.max(1, Math.round(image.height * ratio));
       const canvas = document.createElement("canvas");
       canvas.width = size;
       canvas.height = size;
@@ -152,8 +207,8 @@ export function CutViewport({
       if (!ctx) return;
       try {
         const bitmap = await createImageBitmap(image.element, {
-          resizeWidth: size,
-          resizeHeight: size,
+          resizeWidth: width,
+          resizeHeight: height,
           resizeQuality: "high"
         });
         if (cancelled) {
@@ -163,10 +218,10 @@ export function CutViewport({
         ctx.drawImage(bitmap, 0, 0);
         bitmap.close();
       } catch {
-        ctx.drawImage(image.element, 0, 0, size, size);
+        ctx.drawImage(image.element, 0, 0, width, height);
       }
       if (!cancelled) {
-        proxy_ref.current = { canvas, is_full_res: size === image.element.naturalWidth };
+        proxy_ref.current = { canvas, is_full_res: size === padded_size };
       }
     };
 
@@ -174,14 +229,14 @@ export function CutViewport({
     return () => {
       cancelled = true;
     };
-  }, [image]);
+  }, [image, padded_size]);
 
   // draw the inspected tile into the overlay canvas: instantly from the proxy,
   // then refined from the full-resolution source decoded off the main thread.
   // The canvas is opaque and painted with the app background first so tiles
   // with transparency show the viewport ground, not the image underneath.
   useEffect(() => {
-    if (!inspected_cell || !image) return;
+    if (!inspected_cell || !image || !padded_size) return;
     const canvas = canvas_ref.current;
     const frame = frame_ref.current;
     if (!canvas || !frame) return;
@@ -197,9 +252,15 @@ export function CutViewport({
     ctx.imageSmoothingEnabled = false;
     const token = ++draw_token.current;
 
+    // where the image ends inside the tile, in canvas px from its top left (the rest of the tile is pad)
+    const full_tile = padded_size / n;
+    const image_right = ((image.width - inspected_cell.x * full_tile) / full_tile) * size;
+    const image_bottom = ((image.height - inspected_cell.y * full_tile) / full_tile) * size;
+    const holds_image = image_right > 0 && image_bottom > 0;
+
     const paint = (source: CanvasImageSource, source_size: number) => {
       const src_tile = source_size / n;
-      ctx.fillStyle = "#070a0f";
+      ctx.fillStyle = VIEWPORT_BG;
       ctx.fillRect(0, 0, size, size);
       ctx.drawImage(
         source,
@@ -212,6 +273,7 @@ export function CutViewport({
         size,
         size
       );
+      paint_pad(ctx, size, image_right, image_bottom);
     };
 
     const proxy = proxy_ref.current;
@@ -219,9 +281,12 @@ export function CutViewport({
       paint(proxy.canvas, proxy.canvas.width);
       if (proxy.is_full_res) return;
     } else {
-      ctx.fillStyle = "#070a0f";
+      ctx.fillStyle = VIEWPORT_BG;
       ctx.fillRect(0, 0, size, size);
+      paint_pad(ctx, size, image_right, image_bottom);
     }
+    // a tile of the pad alone has nothing to refine
+    if (!holds_image) return;
 
     // refine from the original source, decoded off the main thread: blob
     // sources decode on background threads (element sources decode on the
@@ -230,8 +295,7 @@ export function CutViewport({
     if (!blob_promise_ref.current) {
       blob_promise_ref.current = fetch(image.src).then((response) => response.blob());
     }
-    const full = image.element.naturalWidth;
-    const full_tile = full / n;
+    // the crop is a tile of the padded square: the part past the image's edge comes back transparent
     const crop = [
       Math.round(inspected_cell.x * full_tile),
       Math.round(inspected_cell.y * full_tile),
@@ -249,14 +313,15 @@ export function CutViewport({
       )
       .then((bitmap) => {
         if (draw_token.current === token && canvas_ref.current) {
-          ctx.fillStyle = "#070a0f";
+          ctx.fillStyle = VIEWPORT_BG;
           ctx.fillRect(0, 0, size, size);
           ctx.drawImage(bitmap, 0, 0, size, size);
+          paint_pad(ctx, size, image_right, image_bottom);
         }
         bitmap.close();
       })
       .catch(() => {});
-  }, [inspected_cell, image, n]);
+  }, [inspected_cell, image, n, padded_size]);
 
   // expand on the frame after the collapsed canvas is committed, so the transition runs
   useEffect(() => {
@@ -318,18 +383,18 @@ export function CutViewport({
 
   useEffect(() => {
     const section = section_ref.current;
-    if (!section || !image) return;
+    if (!section || !plan) return;
 
     const handle_wheel = (e: WheelEvent) => {
       e.preventDefault();
       if (is_generating) return;
       const delta = e.deltaY > 0 ? -1 : 1;
-      on_zoom_change(Math.min(Math.max(zoom + delta, 0), image.plan.max_zoom));
+      on_zoom_change(Math.min(Math.max(zoom + delta, 0), plan.max_zoom));
     };
 
     section.addEventListener("wheel", handle_wheel, { passive: false });
     return () => section.removeEventListener("wheel", handle_wheel);
-  }, [image, zoom, is_generating, on_zoom_change]);
+  }, [plan, zoom, is_generating, on_zoom_change]);
 
   const handle_mouse_move = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!image || inspected_cell) return;
@@ -400,7 +465,7 @@ export function CutViewport({
         onChange={(e) => on_files(e.target.files)}
       />
 
-      {image ? (
+      {image && plan ? (
         <>
           <div
             ref={frame_ref}
@@ -421,12 +486,15 @@ export function CutViewport({
             onMouseLeave={() => set_hover_cell(null)}
             onClick={handle_cell_click}
           >
+            {/* the frame is the padded square; the image sits at its top left, the pad is hatched */}
             <img
               src={image.src}
               alt={`Cut preview of ${image.file_name}`}
-              className="h-full w-full select-none object-fill"
+              className="absolute left-0 top-0 select-none object-fill"
+              style={{ width: `${(image.width / padded_size) * 100}%`, height: `${(image.height / padded_size) * 100}%` }}
               draggable={false}
             />
+            <PadHatch content_width={image.width / padded_size} content_height={image.height / padded_size} />
             <div
               className={`pointer-events-none absolute inset-0 transition-opacity duration-300 ${
                 show_tile_view ? "opacity-0" : "opacity-100"
@@ -547,7 +615,7 @@ export function CutViewport({
                 <div className="mt-3 text-[12px] leading-relaxed tracking-[0.12em] text-[var(--c-dim)]">
                   or click to browse
                   <br />
-                  <span className="data text-[11px]">SQUARE · EVEN PX · ≥128PX</span>
+                  <span className="data text-[11px]">ANY SHAPE · ≥128PX EACH WAY</span>
                 </div>
               </>
             )}

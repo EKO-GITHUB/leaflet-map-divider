@@ -362,7 +362,8 @@ async function generate_zoom_level(
   // with skip_blank: is the tile at (x, y) blank, so it is not written
   let is_blank_tile: ((x: number, y: number) => boolean) | null = null;
   if (source.kind === "image") {
-    // the image sits at the top left of the level's square; under tile size "auto" it fills it exactly
+    // the image sits at the top left of the level's square and the rest stays transparent (the pad); an even-sided
+    // square under tile size "auto" fills it exactly
     const { image } = source;
     setup_canvas(state, level_size, level_size);
     draw_scaled_image(state, image, image.naturalWidth / scale, image.naturalHeight / scale, scale);

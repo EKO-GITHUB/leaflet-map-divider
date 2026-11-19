@@ -10,6 +10,7 @@ export function get_file_type_error(file: File): string {
   return `File type: ${file_type} ${ERROR_MESSAGES.NOT_IMAGE}`;
 }
 
+// any image of at least MIN_TILE_SIZE px each way can be tiled, under every tile size mode
 export function validate_image_dimensions(img: HTMLImageElement): TilePlanResult {
   return plan_tiles(img.naturalWidth, img.naturalHeight);
 }
