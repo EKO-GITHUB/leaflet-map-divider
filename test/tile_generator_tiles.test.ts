@@ -2,7 +2,7 @@ import JSZip from "jszip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { generate_tiles, MAX_PENDING_ENCODES } from "@/services/tile_generator";
 import { plan_tiles, TilePlan } from "@/services/tile_plan";
-import { OutputFormat } from "@/types/types";
+import { OutputFormat, TileGenerationProgress } from "@/types/types";
 import { DownscaleMode } from "@/services/downscale";
 import { compare_rgba } from "./fixtures/compare";
 import { AlphaMode, crop, noise_pixel, reference_pyramid } from "./fixtures/downscale_reference";
@@ -504,5 +504,177 @@ describe("smooth downscale", () => {
     await new Promise(resolve => setTimeout(resolve, 30));
     expect(log.encodes).toHaveLength(64);
     expect(zip_spy).not.toHaveBeenCalled();
+  });
+});
+
+describe("skip blank tiles", () => {
+  // the pattern's transparent bottom-right corner is a quarter of the side: 2x2 tiles at z3, 1 tile at z2, part of a
+  // tile above. Paths are z/y/x
+  const EXPECTED_SKIPPED = ["3/6/6", "3/7/6", "3/6/7", "3/7/7", "2/3/3"];
+
+  async function cut_skipping(spec: PatternSpec, downscale: DownscaleMode, skip_blank: boolean) {
+    const plan = valid_plan(spec.width, spec.height);
+    const progress: TileGenerationProgress[] = [];
+    const blob = await generate_tiles({
+      image: pattern_image(spec) as unknown as HTMLImageElement,
+      plan,
+      output_format: "png",
+      downscale,
+      skip_blank,
+      file_name: `${spec.name}.png`,
+      on_progress: next => progress.push(structuredClone(next))
+    });
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const names = local_entries(bytes)
+      .map(entry => entry.name)
+      .filter(name => !name.endsWith("/"));
+    return { plan, bytes, names, final: progress[progress.length - 1] };
+  }
+
+  describe.each(FIXTURE_PATTERNS)("on $name", spec => {
+    it.each(["pixel", "smooth"] as const)("leaves out 4 tiles at z3, 1 at z2 and none above (%s)", async downscale => {
+      const { plan, names, final } = await cut_skipping(spec, downscale, true);
+
+      const all = [...plan.levels].reverse().flatMap(level =>
+        Array.from({ length: level.tile_count }, (_, i) => {
+          const x = Math.floor(i / level.tiles_per_side);
+          const y = i % level.tiles_per_side;
+          return `${level.zoom}/${y}/${x}`;
+        })
+      );
+      // the written tiles keep the cut's order; exactly the corner's tiles are missing
+      expect(names).toEqual(all.filter(name => !EXPECTED_SKIPPED.includes(name)).map(name => `${name}.png`));
+      expect(log.encodes).toHaveLength(plan.total_tiles - 5);
+
+      // the progress panel counts them: per zoom and in all, as processed tiles too
+      expect(final.current_stage).toBe("complete");
+      expect(final.processed_tiles).toBe(plan.total_tiles);
+      expect(final.skipped_tiles).toBe(5);
+      const skipped_by_zoom = Object.fromEntries(
+        final.zoom_levels_progress.map(row => [row.zoom_level, row.skipped_tiles_in_level])
+      );
+      expect(skipped_by_zoom).toEqual({ 3: 4, 2: 1, 1: 0, 0: 0 });
+      expect(final.zoom_levels_progress.every(row => row.processed_tiles_in_level === row.total_tiles_in_level)).toBe(
+        true
+      );
+    });
+
+    it("writes the same bytes for every tile it keeps", async () => {
+      const kept = local_entries((await cut_skipping(spec, "smooth", false)).bytes);
+      expect(kept.filter(entry => !entry.name.endsWith("/"))).toHaveLength(85);
+      log = { encodes: [], in_flight: 0, max_in_flight: 0, reads: [] };
+      const skipping = local_entries((await cut_skipping(spec, "smooth", true)).bytes);
+      const by_name = new Map(kept.map(entry => [entry.name, entry.data]));
+      const tiles = skipping.filter(entry => !entry.name.endsWith("/"));
+      expect(tiles).toHaveLength(80);
+      for (const entry of tiles) {
+        expect(Buffer.from(entry.data).equals(Buffer.from(by_name.get(entry.name)!)), entry.name).toBe(true);
+      }
+    });
+  });
+
+  it("writes every tile and counts none skipped when it is off or left out", async () => {
+    const spec = FIXTURE_PATTERNS[0];
+    const off = await cut_skipping(spec, "pixel", false);
+    expect(off.names).toHaveLength(off.plan.total_tiles);
+    expect(off.final.skipped_tiles).toBe(0);
+    expect(off.final.zoom_levels_progress.every(row => row.skipped_tiles_in_level === 0)).toBe(true);
+
+    log = { encodes: [], in_flight: 0, max_in_flight: 0, reads: [] };
+    const { plan, bytes } = await cut(spec);
+    expect(local_entries(bytes).filter(entry => !entry.name.endsWith("/"))).toHaveLength(plan.total_tiles);
+    // the tile canvas is never read back
+    expect(log.reads).toHaveLength(0);
+  });
+
+  it("reads each drawn level once to find its blank tiles, never a tile on its own", async () => {
+    const spec = FIXTURE_PATTERNS[0];
+    await cut_skipping(spec, "pixel", true);
+    // pixel mode draws every level from the image: one read of each whole level (1024 px levels fit in one band)
+    expect(log.reads).toEqual([1024, 512, 256, 128].map(size => ({ canvas_size: size, y: 0, rows: size })));
+
+    log = { encodes: [], in_flight: 0, max_in_flight: 0, reads: [] };
+    await cut_skipping(spec, "smooth", true);
+    // smooth draws only the top level: read for its blank tiles, then for the downscale; the levels below are in memory
+    expect(log.reads).toEqual([
+      { canvas_size: 1024, y: 0, rows: 1024 },
+      { canvas_size: 1024, y: 0, rows: 1024 }
+    ]);
+  });
+
+  it("finds blank tiles across the bands of a large level", async () => {
+    // opaque noise with a transparent stripe over the tile rows 7 and 8 of z5 (source rows 896-1151), across the
+    // seam of the first two bands (1024 rows each: 8 rows of 128 px tiles)
+    const noise = noise_image(4096, 9, "opaque");
+    const image: FakeImage = {
+      ...noise,
+      write: (x, y, out, offset) => (y >= 896 && y < 1152 ? TRANSPARENT(x, y, out, offset) : noise.write(x, y, out, offset))
+    };
+    const plan = valid_plan(4096, 4096);
+    const progress: TileGenerationProgress[] = [];
+    const blob = await generate_tiles({
+      image: image as unknown as HTMLImageElement,
+      plan,
+      output_format: "png",
+      skip_blank: true,
+      file_name: "stripe-4096.png",
+      on_progress: next => progress.push(structuredClone(next))
+    });
+    const names = new Set(local_entries(new Uint8Array(await blob.arrayBuffer())).map(entry => entry.name));
+
+    const top = log.reads.filter(read => read.canvas_size === 4096);
+    expect(top.map(read => [read.y, read.rows])).toEqual([[0, 1024], [1024, 1024], [2048, 1024], [3072, 1024]]);
+    const final = progress[progress.length - 1];
+    // only z5 has whole tiles inside the stripe: 2 rows of 32
+    expect(final.skipped_tiles).toBe(64);
+    expect(final.zoom_levels_progress.find(row => row.zoom_level === 5)!.skipped_tiles_in_level).toBe(64);
+    for (let x = 0; x < 32; x++) {
+      for (const y of [6, 7, 8, 9]) expect(names.has(`5/${y}/${x}.png`), `5/${y}/${x}`).toBe(y === 6 || y === 9);
+    }
+    expect(names.size - [...names].filter(name => name.endsWith("/")).length).toBe(plan.total_tiles - 64);
+  }, 60_000);
+
+  it("keeps a tile that holds a single faint pixel", async () => {
+    // a transparent 1024 px image with one pixel of alpha 1 inside the tile 5,2 of z3
+    const image: FakeImage = {
+      naturalWidth: 1024,
+      naturalHeight: 1024,
+      write: (x, y, out, offset) => {
+        out.fill(0, offset, offset + 4);
+        if (x === 5 * 128 + 77 && y === 2 * 128 + 3) out[offset + 3] = 1;
+      }
+    };
+    const plan = valid_plan(1024, 1024);
+    const blob = await generate_tiles({
+      image: image as unknown as HTMLImageElement,
+      plan,
+      output_format: "png",
+      skip_blank: true,
+      file_name: "faint.png"
+    });
+    const names = local_entries(new Uint8Array(await blob.arrayBuffer()))
+      .map(entry => entry.name)
+      .filter(name => !name.endsWith("/"));
+    // pixel mode samples the top left of each cell below z3, so the faint pixel is gone there
+    expect(names).toEqual(["3/2/5.png"]);
+  });
+
+  it("cuts a fully transparent image to an archive without tiles, yielding to the browser on the way", async () => {
+    const transparent: FakeImage = { naturalWidth: 1024, naturalHeight: 1024, write: TRANSPARENT };
+    const channel_spy = vi.spyOn(globalThis, "MessageChannel");
+    const plan = valid_plan(1024, 1024);
+    const blob = await generate_tiles({
+      image: transparent as unknown as HTMLImageElement,
+      plan,
+      output_format: "png",
+      downscale: "smooth",
+      skip_blank: true,
+      file_name: "transparent.png"
+    });
+    const entries = local_entries(new Uint8Array(await blob.arrayBuffer()));
+    expect(entries.filter(entry => !entry.name.endsWith("/"))).toHaveLength(0);
+    expect(log.encodes).toHaveLength(0);
+    // a yield every 10 tiles (85 tiles: 8), plus one per downscale band (3 levels)
+    expect(channel_spy.mock.calls.length).toBeGreaterThanOrEqual(8);
   });
 });

@@ -71,6 +71,15 @@ const DOWNSCALE_OPTIONS = [
   { value: "smooth", label: "SMOOTH" }
 ] as const;
 
+const BLANK_TILE_OPTIONS = [
+  { value: "skip", label: "SKIP" },
+  { value: "keep", label: "KEEP" }
+] as const;
+
+function plural_tiles(count: number) {
+  return `${count.toLocaleString()} blank tile${count === 1 ? "" : "s"}`;
+}
+
 function DataRow({ label, children }: {
   label: string;
   children: React.ReactNode;
@@ -100,6 +109,8 @@ export function InstrumentApp() {
     set_output_format,
     downscale_mode,
     set_downscale_mode,
+    skip_blank,
+    set_skip_blank,
     generate_tiles,
     cancel_generation,
     reset_error
@@ -108,6 +119,8 @@ export function InstrumentApp() {
   const input_ref = useRef<HTMLInputElement>(null);
   const [preview_zoom, set_preview_zoom] = useState(0);
   const [has_saved, set_has_saved] = useState(false);
+  // blank tiles the saved archive left out
+  const [saved_skipped, set_saved_skipped] = useState(0);
   const eta = useEta(is_generating, progress);
 
   const [previewed_image, set_previewed_image] = useState(selected_image);
@@ -123,6 +136,7 @@ export function InstrumentApp() {
     set_seen_stage(progress.current_stage);
     if (progress.current_stage === "complete") {
       set_has_saved(true);
+      set_saved_skipped(progress.skipped_tiles);
     }
   }
 
@@ -303,6 +317,18 @@ export function InstrumentApp() {
                     : "2×2 average — for painted and 3D maps"
                 }
               />
+              <ChoiceGroup
+                label="BLANK TILES"
+                options={BLANK_TILE_OPTIONS}
+                value={skip_blank ? "skip" : "keep"}
+                on_change={(value) => set_skip_blank(value === "skip")}
+                disabled={is_generating}
+                hint={
+                  skip_blank
+                    ? "Fully transparent tiles are left out"
+                    : "Every tile is written, transparent ones too"
+                }
+              />
             </div>
           </RailSection>
 
@@ -340,6 +366,11 @@ export function InstrumentApp() {
                     {eta ? ` · ${eta}` : ""}
                   </span>
                 </div>
+                {skip_blank && (
+                  <div className="data mt-1 text-[11px] text-[var(--c-dim)]">
+                    Skipped {plural_tiles(progress.skipped_tiles)}
+                  </div>
+                )}
 
                 <div className="mt-3 space-y-1.5">
                   {progress.zoom_levels_progress.map((zoom_row) => (
@@ -372,6 +403,11 @@ export function InstrumentApp() {
                 {show_saved && (
                   <div className="mb-3 border border-[var(--c-acc)]/50 bg-[#3dffa0]/5 px-3 py-2 text-[12px] font-medium text-[var(--c-acc)]">
                     ■ Archive saved to downloads
+                    {saved_skipped > 0 && (
+                      <div className="data mt-1 text-[11px] font-normal text-[var(--c-dim)]">
+                        {plural_tiles(saved_skipped)} skipped
+                      </div>
+                    )}
                   </div>
                 )}
                 <button

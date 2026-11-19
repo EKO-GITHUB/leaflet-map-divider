@@ -3,6 +3,7 @@ import { OutputFormat, TileGenerationProgress, ZoomLevelProgress } from "@/types
 import { MIME_TYPES } from "@/constants/constants";
 import { TileLevel, TilePlan } from "@/services/tile_plan";
 import { DEFAULT_DOWNSCALE_MODE, DownscaleMode, downscale_2x } from "@/services/downscale";
+import { is_blank_region } from "@/services/blank_tile";
 
 interface TileGeneratorOptions {
   image: HTMLImageElement;
@@ -10,6 +11,9 @@ interface TileGeneratorOptions {
   output_format: OutputFormat;
   // how the levels below the top zoom are made (see downscale.ts); "pixel" when left out
   downscale?: DownscaleMode;
+  // a tile whose pixels all have alpha 0 is not written (it still counts as processed, and as skipped); every tile is
+  // written when left out
+  skip_blank?: boolean;
   file_name: string;
   on_progress?: (progress: TileGenerationProgress) => void;
   on_error?: (error: string) => void;
@@ -130,6 +134,7 @@ function initialize_zoom_levels_progress(plan: TilePlan): ZoomLevelProgress[] {
     zoom_level: level.zoom,
     total_tiles_in_level: level.tile_count,
     processed_tiles_in_level: 0,
+    skipped_tiles_in_level: 0,
     progress_percentage: 0,
     is_complete: false
   }));
@@ -221,6 +226,30 @@ function put_level_tile(state: TileGeneratorState, level: LevelPixels, start_x: 
   }
   // putImageData replaces the pixels (no compositing) and copies them, so the buffer is reused for the next tile
   state.tile_ctx.putImageData(image_data, 0, 0);
+}
+
+// which tiles of the level the canvas holds are blank (every alpha 0), by y * tiles_per_side + x. The canvas is read
+// once, in bands of whole tile rows of about DOWNSCALE_BAND_PIXELS pixels, instead of reading every tile back: a
+// read of a GPU canvas is a slow round trip, and the tile canvas stays as it is, so the tiles that are written come out
+// exactly as when nothing is skipped. Yields between bands; an abort stops it there
+async function blank_tiles_of_canvas(state: TileGeneratorState, level: TileLevel, tile_size: number, signal?: AbortSignal) {
+  const { tiles_per_side, level_size } = level;
+  const blank = new Uint8Array(tiles_per_side * tiles_per_side);
+  const tile_rows = Math.max(1, Math.floor(DOWNSCALE_BAND_PIXELS / (level_size * tile_size)));
+  for (let ty = 0; ty < tiles_per_side; ty += tile_rows) {
+    signal?.throwIfAborted();
+    const rows = Math.min(tile_rows, tiles_per_side - ty);
+    const band = state.ctx.getImageData(0, ty * tile_size, level_size, rows * tile_size).data;
+    for (let row = 0; row < rows; row++) {
+      for (let tx = 0; tx < tiles_per_side; tx++) {
+        if (is_blank_region(band, level_size, tx * tile_size, row * tile_size, tile_size)) {
+          blank[(ty + row) * tiles_per_side + tx] = 1;
+        }
+      }
+    }
+    await next_task(signal);
+  }
+  return blank;
 }
 
 // an encode that has been started but whose bytes are not in the zip yet
@@ -317,26 +346,39 @@ async function generate_zoom_level(
     level: TileLevel;
     tile_size: number;
     output_format: OutputFormat;
+    skip_blank: boolean;
     on_progress?: (processed_count: number) => void;
-    on_tile_progress?: () => void;
+    // a tile was written (skipped false) or left out as blank (skipped true)
+    on_tile_progress?: (skipped: boolean) => void;
     signal?: AbortSignal;
   }
 ): Promise<void> {
-  const { source, level, tile_size, output_format, on_progress, on_tile_progress, signal } = options;
+  const { source, level, tile_size, output_format, skip_blank, on_progress, on_tile_progress, signal } = options;
   const { zoom: zoom_level, tiles_per_side, level_size, scale } = level;
 
   signal?.throwIfAborted();
 
   let pixels: LevelPixels | undefined;
+  // with skip_blank: is the tile at (x, y) blank, so it is not written
+  let is_blank_tile: ((x: number, y: number) => boolean) | null = null;
   if (source.kind === "image") {
     // the image sits at the top left of the level's square; under tile size "auto" it fills it exactly
     const { image } = source;
     setup_canvas(state, level_size, level_size);
     draw_scaled_image(state, image, image.naturalWidth / scale, image.naturalHeight / scale, scale);
+    if (skip_blank) {
+      const blank = await blank_tiles_of_canvas(state, level, tile_size, signal);
+      is_blank_tile = (x, y) => blank[y * tiles_per_side + x] === 1;
+    }
   } else {
-    pixels = source.pixels;
-    if (pixels.size !== level_size) {
-      throw new Error(`Zoom ${zoom_level} is ${level_size}px, but its downscaled pixels are ${pixels.size}px`);
+    const level_pixels = source.pixels;
+    pixels = level_pixels;
+    if (level_pixels.size !== level_size) {
+      throw new Error(`Zoom ${zoom_level} is ${level_size}px, but its downscaled pixels are ${level_pixels.size}px`);
+    }
+    // a level in memory is checked in place
+    if (skip_blank) {
+      is_blank_tile = (x, y) => is_blank_region(level_pixels.data, level_size, x * tile_size, y * tile_size, tile_size);
     }
   }
 
@@ -344,23 +386,32 @@ async function generate_zoom_level(
   // encodes in flight, oldest first; they are added to the zip in the order they were started
   const pending: PendingTile[] = [];
 
-  const finish_oldest = async () => {
-    const tile = pending.shift();
-    if (!tile) return;
-    await finish_tile(state, tile, signal);
-
+  // a skipped tile counts at once; it counts towards the yields too, so a long run of blank tiles still lets the
+  // browser in
+  const count_tile = async (skipped: boolean) => {
     processed_count++;
-    on_tile_progress?.();
+    on_tile_progress?.(skipped);
 
     if (processed_count % PROGRESS_BATCH_SIZE === 0) {
       await next_task(signal);
     }
   };
 
+  const finish_oldest = async () => {
+    const tile = pending.shift();
+    if (!tile) return;
+    await finish_tile(state, tile, signal);
+    await count_tile(false);
+  };
+
   for (let x = 0; x < tiles_per_side; x++) {
     for (let y = 0; y < tiles_per_side; y++) {
       signal?.throwIfAborted();
 
+      if (is_blank_tile?.(x, y)) {
+        await count_tile(true);
+        continue;
+      }
       pending.push(start_tile(state, { x, y, zoom_level, tile_size, output_format, pixels }));
 
       if (pending.length >= MAX_PENDING_ENCODES) {
@@ -379,6 +430,7 @@ async function generate_zoom_level(
 export async function generate_tiles(options: TileGeneratorOptions): Promise<Blob> {
   const { image, plan, output_format, on_progress, on_error, signal } = options;
   const downscale = options.downscale ?? DEFAULT_DOWNSCALE_MODE;
+  const skip_blank = options.skip_blank ?? false;
   const { max_zoom: max_zoom_level, total_tiles } = plan;
 
   signal?.throwIfAborted();
@@ -393,6 +445,7 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
   try {
     const zoom_levels_progress = initialize_zoom_levels_progress(plan);
     let processed_tile_count = 0;
+    let skipped_tile_count = 0;
     const start_time = Date.now();
     let last_update_time = start_time;
     // smooth: the level below the one just cut, made from it. Pixel (and the top level): drawn from the image
@@ -403,6 +456,7 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
       progress: 0,
       total_tiles,
       processed_tiles: 0,
+      skipped_tiles: 0,
       zoom_levels_progress: [...zoom_levels_progress],
       current_stage: "preparing"
     });
@@ -415,6 +469,7 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
         progress: Math.floor((processed_tile_count / total_tiles) * 100),
         total_tiles,
         processed_tiles: processed_tile_count,
+        skipped_tiles: skipped_tile_count,
         zoom_levels_progress: [...zoom_levels_progress],
         current_stage: "generating"
       });
@@ -426,9 +481,14 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
         level: plan.levels[z],
         tile_size: plan.tile_size,
         output_format,
+        skip_blank,
         signal,
-        on_tile_progress: () => {
+        on_tile_progress: skipped => {
           zoom_levels_progress[zoom_index].processed_tiles_in_level++;
+          if (skipped) {
+            zoom_levels_progress[zoom_index].skipped_tiles_in_level++;
+            skipped_tile_count++;
+          }
           zoom_levels_progress[zoom_index].progress_percentage = Math.floor(
             (zoom_levels_progress[zoom_index].processed_tiles_in_level /
               zoom_levels_progress[zoom_index].total_tiles_in_level) * 100
@@ -447,6 +507,7 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
               progress: overall_progress,
               total_tiles,
               processed_tiles: processed_tile_count,
+              skipped_tiles: skipped_tile_count,
               zoom_levels_progress: [...zoom_levels_progress],
               current_stage: "generating",
               tiles_per_second: Math.round(tiles_per_second * 10) / 10
@@ -468,6 +529,7 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
             progress: Math.floor((processed_tile_count / total_tiles) * 100),
             total_tiles,
             processed_tiles: processed_tile_count,
+            skipped_tiles: skipped_tile_count,
             zoom_levels_progress: [...zoom_levels_progress],
             current_stage: "generating",
             tiles_per_second: Math.round(tiles_per_second * 10) / 10
@@ -491,6 +553,7 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
       progress: 100,
       total_tiles,
       processed_tiles: processed_tile_count,
+      skipped_tiles: skipped_tile_count,
       zoom_levels_progress: [...zoom_levels_progress],
       current_stage: "complete",
       tiles_per_second: Math.round((processed_tile_count / ((Date.now() - start_time) / 1000)) * 10) / 10

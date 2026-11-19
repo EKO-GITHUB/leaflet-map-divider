@@ -4,6 +4,8 @@ export interface ZoomLevelProgress {
   zoom_level: number;
   total_tiles_in_level: number;
   processed_tiles_in_level: number;
+  // processed tiles that were blank and not written (included in processed_tiles_in_level)
+  skipped_tiles_in_level: number;
   progress_percentage: number;
   is_complete: boolean;
 }
@@ -13,6 +15,8 @@ export interface TileGenerationProgress {
   progress: number;
   total_tiles: number;
   processed_tiles: number;
+  // processed tiles that were blank and not written (included in processed_tiles)
+  skipped_tiles: number;
   zoom_levels_progress: ZoomLevelProgress[];
   current_stage: "preparing" | "generating" | "complete" | "error";
   tiles_per_second?: number;
