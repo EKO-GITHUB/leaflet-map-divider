@@ -1,9 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { MapImage, OutputFormat, TileGenerationProgress } from "@/types/types";
 import { download_zip_file, generate_tiles } from "@/services/tile_generator";
-import { DEFAULT_DOWNSCALE_MODE, DownscaleMode } from "@/services/downscale";
-import { DEFAULT_SKIP_BLANK } from "@/services/blank_tile";
-import { DEFAULT_TILE_SIZE_MODE, TilePlan, TileSizeMode } from "@/services/tile_plan";
+import { DownscaleMode } from "@/services/downscale";
+import { TilePlan, TileSizeMode } from "@/services/tile_plan";
+import { cut_options_store } from "@/utils/cut_options";
+
+const set_output_format = (format: OutputFormat) => cut_options_store.update({ format });
+const set_downscale_mode = (downscale: DownscaleMode) => cut_options_store.update({ downscale });
+const set_tile_size_mode = (tile_size: TileSizeMode) => cut_options_store.update({ tile_size });
+const set_skip_blank = (skip_blank: boolean) => cut_options_store.update({ skip_blank });
 
 export function useTileGeneration() {
   const [is_generating, set_is_generating] = useState(false);
@@ -17,10 +22,13 @@ export function useTileGeneration() {
     zoom_levels_progress: [],
     current_stage: "preparing"
   });
-  const [output_format, set_output_format] = useState<OutputFormat>("png");
-  const [downscale_mode, set_downscale_mode] = useState<DownscaleMode>(DEFAULT_DOWNSCALE_MODE);
-  const [skip_blank, set_skip_blank] = useState(DEFAULT_SKIP_BLANK);
-  const [tile_size_mode, set_tile_size_mode] = useState<TileSizeMode>(DEFAULT_TILE_SIZE_MODE);
+  // the options of panel 03, remembered in localStorage; the server render and hydration use the defaults
+  const options = useSyncExternalStore(
+    cut_options_store.subscribe,
+    cut_options_store.get_snapshot,
+    cut_options_store.get_server_snapshot
+  );
+  const { format: output_format, downscale: downscale_mode, tile_size: tile_size_mode, skip_blank } = options;
 
   // the running cut's controller; null when no cut runs
   const controller_ref = useRef<AbortController | null>(null);

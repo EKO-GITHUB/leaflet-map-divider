@@ -336,7 +336,7 @@ export function InstrumentApp() {
                 value={output_format}
                 on_change={set_output_format}
                 disabled={is_generating}
-                hint={output_format === "png" ? "Lossless — larger archive" : "Compressed — smaller archive"}
+                hint={output_format === "png" ? "Lossless — larger archive" : "Lossless too — smaller archive"}
               />
               <ChoiceGroup
                 label="DOWNSCALE"
