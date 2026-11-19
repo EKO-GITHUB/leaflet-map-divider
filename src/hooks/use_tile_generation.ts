@@ -59,6 +59,7 @@ export function useTileGeneration() {
         downscale: downscale_mode,
         skip_blank,
         file_name: image.file_name,
+        source_file: image.file,
         signal,
         // an aborted cut no longer writes to the panel
         on_progress: next => {

@@ -4,6 +4,16 @@ import { MIME_TYPES } from "@/constants/constants";
 import { TileLevel, TilePlan } from "@/services/tile_plan";
 import { DEFAULT_DOWNSCALE_MODE, DownscaleMode, downscale_2x } from "@/services/downscale";
 import { is_blank_region } from "@/services/blank_tile";
+import {
+  crop_top_left,
+  halve_image,
+  plan_preview,
+  PREVIEW_FILE,
+  PREVIEW_MIME_TYPE,
+  PreviewPlan,
+  RgbaImage
+} from "@/services/preview";
+import { build_tiles_manifest, MANIFEST_FILE, serialize_tiles_manifest, sha256_hex, tile_path } from "@/services/tiles_manifest";
 
 interface TileGeneratorOptions {
   image: HTMLImageElement;
@@ -14,7 +24,9 @@ interface TileGeneratorOptions {
   // a tile whose pixels all have alpha 0 is not written (it still counts as processed, and as skipped); every tile is
   // written when left out
   skip_blank?: boolean;
+  // the source file's name and bytes, for tiles.json (the bytes are hashed while the tiles are cut)
   file_name: string;
+  source_file: Blob;
   on_progress?: (progress: TileGenerationProgress) => void;
   on_error?: (error: string) => void;
   // aborting stops the cut before the next tile (or while the zip is being built) and rejects with the signal's reason
@@ -28,6 +40,9 @@ interface TileGeneratorState {
   tile_ctx: CanvasRenderingContext2D;
   // the tile-sized buffer a level held in memory is copied through (smooth downscale)
   tile_image_data: ImageData | null;
+  // holds preview.webp from the moment its level is cut until it is encoded, after the last tile
+  preview_canvas: HTMLCanvasElement;
+  preview_ctx: CanvasRenderingContext2D;
   zip: JSZip;
 }
 
@@ -108,13 +123,16 @@ function create_generator_state(): TileGeneratorState | null {
     const tile_canvas = document.createElement("canvas");
     const tile_ctx = tile_canvas.getContext("2d");
 
-    if (!ctx || !tile_ctx) {
+    const preview_canvas = document.createElement("canvas");
+    const preview_ctx = preview_canvas.getContext("2d");
+
+    if (!ctx || !tile_ctx || !preview_ctx) {
       throw new Error("Canvas context not supported");
     }
 
     const zip = new JSZip();
 
-    return { canvas, ctx, tile_canvas, tile_ctx, tile_image_data: null, zip };
+    return { canvas, ctx, tile_canvas, tile_ctx, tile_image_data: null, preview_canvas, preview_ctx, zip };
   } catch (error) {
     console.error("Failed to create generator state:", error);
     return null;
@@ -126,6 +144,8 @@ function cleanup_generator_state(state: TileGeneratorState) {
   state.canvas.height = 0;
   state.tile_canvas.width = 0;
   state.tile_canvas.height = 0;
+  state.preview_canvas.width = 0;
+  state.preview_canvas.height = 0;
 }
 
 // the cut runs from the maximum zoom down to z0
@@ -228,6 +248,48 @@ function put_level_tile(state: TileGeneratorState, level: LevelPixels, start_x: 
   state.tile_ctx.putImageData(image_data, 0, 0);
 }
 
+function put_image(ctx: CanvasRenderingContext2D, image: RgbaImage) {
+  const image_data = ctx.createImageData(image.width, image.height);
+  image_data.data.set(image.data);
+  ctx.putImageData(image_data, 0, 0);
+}
+
+// copies the content area of the level just cut (the preview's level) into the preview canvas, before the level
+// canvas is redrawn or released; it is encoded after the last tile. The level canvas is copied with drawImage, as its
+// tiles are, so the preview holds the same pixels as the tiles of its level
+function capture_preview(
+  state: TileGeneratorState,
+  source: LevelSource,
+  level: TileLevel,
+  plan: TilePlan,
+  preview: PreviewPlan,
+  downscale: DownscaleMode
+) {
+  const { preview_canvas, preview_ctx } = state;
+  preview_canvas.width = preview.width;
+  preview_canvas.height = preview.height;
+  preview_ctx.imageSmoothingEnabled = false;
+
+  if (preview.extra_halvings === 0) {
+    if (source.kind === "image") {
+      preview_ctx.drawImage(state.canvas, 0, 0, preview.width, preview.height, 0, 0, preview.width, preview.height);
+    } else {
+      put_image(preview_ctx, crop_top_left(source.pixels.data, source.pixels.size, preview.width, preview.height));
+    }
+    return;
+  }
+
+  // even z0's content is larger than the preview: halve it further, the way a lower level would be made
+  const width = Math.ceil(plan.width / level.scale);
+  const height = Math.ceil(plan.height / level.scale);
+  let image: RgbaImage =
+    source.kind === "image"
+      ? { data: state.ctx.getImageData(0, 0, width, height).data, width, height }
+      : crop_top_left(source.pixels.data, source.pixels.size, width, height);
+  for (let i = 0; i < preview.extra_halvings; i++) image = halve_image(image, downscale);
+  put_image(preview_ctx, image);
+}
+
 // which tiles of the level the canvas holds are blank (every alpha 0), by y * tiles_per_side + x. The canvas is read
 // once, in bands of whole tile rows of about DOWNSCALE_BAND_PIXELS pixels, instead of reading every tile back: a
 // read of a GPU canvas is a slow round trip, and the tile canvas stays as it is, so the tiles that are written come out
@@ -321,7 +383,7 @@ function start_tile(
     // rejection
     bytes.catch(() => {});
 
-    return { path: `${zoom_level}/${y}/${x}.${output_format}`, label, bytes };
+    return { path: tile_path(zoom_level, x, y, output_format), label, bytes };
   } catch (error) {
     throw new Error(`Failed to generate ${label}: ${error}`);
   }
@@ -429,10 +491,11 @@ async function generate_zoom_level(
 }
 
 export async function generate_tiles(options: TileGeneratorOptions): Promise<Blob> {
-  const { image, plan, output_format, on_progress, on_error, signal } = options;
+  const { image, plan, output_format, file_name, source_file, on_progress, on_error, signal } = options;
   const downscale = options.downscale ?? DEFAULT_DOWNSCALE_MODE;
   const skip_blank = options.skip_blank ?? false;
   const { max_zoom: max_zoom_level, total_tiles } = plan;
+  const preview = plan_preview(plan);
 
   signal?.throwIfAborted();
 
@@ -444,6 +507,11 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
   }
 
   try {
+    // the source is hashed for tiles.json while the tiles are cut (Web Crypto hashes off the main thread); without
+    // Web Crypto the cut fails here, before any tile
+    const source_sha256 = sha256_hex(source_file);
+    source_sha256.catch(() => {});
+
     const zoom_levels_progress = initialize_zoom_levels_progress(plan);
     let processed_tile_count = 0;
     let skipped_tile_count = 0;
@@ -538,6 +606,10 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
         }
       });
 
+      if (z === preview.zoom) {
+        capture_preview(state, source, plan.levels[z], plan, preview, downscale);
+      }
+
       if (downscale === "smooth" && z > 0) {
         if (source.kind === "image") {
           below = await downscale_canvas(state, plan.levels[z].level_size, signal);
@@ -548,6 +620,41 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
         }
       }
     }
+
+    // preview.webp and tiles.json at the root of the archive, after the tiles
+    let preview_bytes: ArrayBuffer;
+    try {
+      preview_bytes = await (await encode_canvas(state.preview_canvas, PREVIEW_MIME_TYPE)).arrayBuffer();
+    } catch (error) {
+      throw new Error(`Failed to generate ${PREVIEW_FILE}: ${error}`);
+    }
+    signal?.throwIfAborted();
+    state.zip.file(PREVIEW_FILE, preview_bytes, { binary: true });
+
+    let sha256: string;
+    try {
+      sha256 = await source_sha256;
+    } catch (error) {
+      throw new Error(`Failed to hash the source image for ${MANIFEST_FILE}: ${error}`);
+    }
+    signal?.throwIfAborted();
+    const counts = plan.levels.map(level => {
+      const level_progress = zoom_levels_progress.find(entry => entry.zoom_level === level.zoom);
+      if (!level_progress) throw new Error(`Zoom ${level.zoom} was not cut`);
+      const skipped = level_progress.skipped_tiles_in_level;
+      return { written: level_progress.processed_tiles_in_level - skipped, skipped };
+    });
+    const manifest = build_tiles_manifest({
+      plan,
+      source: { name: file_name, sha256 },
+      format: output_format,
+      downscale,
+      skip_blank,
+      counts,
+      preview,
+      created_at: new Date()
+    });
+    state.zip.file(MANIFEST_FILE, serialize_tiles_manifest(manifest));
 
     on_progress?.({
       current_zoom_level: 0,

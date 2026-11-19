@@ -55,6 +55,7 @@ export function useImageUpload() {
         width: validation.plan.width,
         height: validation.plan.height,
         file_name: file.name,
+        file,
         src: img.src
       };
 

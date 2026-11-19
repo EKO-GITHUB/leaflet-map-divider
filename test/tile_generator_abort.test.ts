@@ -9,6 +9,9 @@ const TILE_PNG = Buffer.from(
   "base64"
 );
 
+// preview.webp is encoded once, after the last tile
+const PREVIEW_ENCODES = 1;
+
 // the cut yields to the browser after every 10th tile that reaches the zip
 const PROGRESS_BATCH_SIZE = 10;
 
@@ -68,6 +71,7 @@ function cut(size: number, signal?: AbortSignal) {
     plan: valid_plan(size),
     output_format: "png",
     file_name: `pattern-${size}.png`,
+    source_file: new Blob(["fake source image"]),
     signal,
     on_error,
     on_progress
@@ -82,9 +86,9 @@ describe("generate_tiles with an AbortSignal", () => {
 
     const blob = await promise;
     const zip = await JSZip.loadAsync(await blob.arrayBuffer());
-    const tiles = Object.values(zip.files).filter(entry => !entry.dir);
+    const tiles = Object.values(zip.files).filter(entry => /^\d+\/\d+\/\d+\.png$/.test(entry.name));
 
-    expect(log.encoded_tiles).toBe(85);
+    expect(log.encoded_tiles).toBe(85 + PREVIEW_ENCODES);
     expect(tiles).toHaveLength(85);
     expect(zip_spy).toHaveBeenCalledTimes(1);
     expect(on_error).not.toHaveBeenCalled();
@@ -93,7 +97,7 @@ describe("generate_tiles with an AbortSignal", () => {
   it("still works without a signal", async () => {
     const blob = await cut(1024).promise;
     expect(blob.size).toBeGreaterThan(0);
-    expect(log.encoded_tiles).toBe(85);
+    expect(log.encoded_tiles).toBe(85 + PREVIEW_ENCODES);
   });
 
   it("stops after the tile it was aborted on and rejects with no zip", async () => {
@@ -153,7 +157,7 @@ describe("generate_tiles with an AbortSignal", () => {
     });
 
     await expect(cut(1024, controller.signal).promise).rejects.toThrow("stopped while zipping");
-    expect(log.encoded_tiles).toBe(85);
+    expect(log.encoded_tiles).toBe(85 + PREVIEW_ENCODES);
     expect(pause_spy).toHaveBeenCalledTimes(1);
   });
 });

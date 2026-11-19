@@ -27,5 +27,7 @@ export interface MapImage {
   width: number;
   height: number;
   file_name: string;
+  // the uploaded file itself: its bytes are hashed for the archive's tiles.json
+  file: File;
   src: string;
 }
