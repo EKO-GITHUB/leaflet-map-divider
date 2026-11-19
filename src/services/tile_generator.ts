@@ -2,11 +2,14 @@ import JSZip from "jszip";
 import { OutputFormat, TileGenerationProgress, ZoomLevelProgress } from "@/types/types";
 import { MIME_TYPES } from "@/constants/constants";
 import { TileLevel, TilePlan } from "@/services/tile_plan";
+import { DEFAULT_DOWNSCALE_MODE, DownscaleMode, downscale_2x } from "@/services/downscale";
 
 interface TileGeneratorOptions {
   image: HTMLImageElement;
   plan: TilePlan;
   output_format: OutputFormat;
+  // how the levels below the top zoom are made (see downscale.ts); "pixel" when left out
+  downscale?: DownscaleMode;
   file_name: string;
   on_progress?: (progress: TileGenerationProgress) => void;
   on_error?: (error: string) => void;
@@ -19,8 +22,24 @@ interface TileGeneratorState {
   ctx: CanvasRenderingContext2D;
   tile_canvas: HTMLCanvasElement;
   tile_ctx: CanvasRenderingContext2D;
+  // the tile-sized buffer a level held in memory is copied through (smooth downscale)
+  tile_image_data: ImageData | null;
   zip: JSZip;
 }
+
+// a level held in memory: row-major RGBA, size x size
+interface LevelPixels {
+  data: Uint8ClampedArray;
+  size: number;
+}
+
+// where a zoom level's pixels come from: the source image drawn at the level's scale, or a level the smooth
+// downscale built from the level above
+type LevelSource = { kind: "image"; image: HTMLImageElement } | { kind: "pixels"; pixels: LevelPixels };
+
+// the smooth downscale reads and shrinks a level in bands of about this many source pixels, yielding to the browser
+// between bands (the top level of a 16384 px image is 1 GiB of RGBA)
+const DOWNSCALE_BAND_PIXELS = 1 << 22;
 
 const PROGRESS_BATCH_SIZE = 10;
 // encodes started and not yet in the zip; Chrome encodes WebP off the main thread, so several overlap
@@ -91,7 +110,7 @@ function create_generator_state(): TileGeneratorState | null {
 
     const zip = new JSZip();
 
-    return { canvas, ctx, tile_canvas, tile_ctx, zip };
+    return { canvas, ctx, tile_canvas, tile_ctx, tile_image_data: null, zip };
   } catch (error) {
     console.error("Failed to create generator state:", error);
     return null;
@@ -152,6 +171,58 @@ function draw_scaled_image(
   }
 }
 
+// an even number of rows of a size px wide level, about DOWNSCALE_BAND_PIXELS pixels
+function band_rows(size: number): number {
+  const rows = Math.max(2, Math.floor(DOWNSCALE_BAND_PIXELS / size));
+  return Math.min(size, rows - (rows % 2));
+}
+
+// the smooth downscale of a size x size level, band by band; read_band(y, rows) hands back that band's RGBA. Yields
+// to the browser between bands, and an abort stops it there
+async function downscale_level(
+  size: number,
+  read_band: (y: number, rows: number) => Uint8Array | Uint8ClampedArray,
+  signal?: AbortSignal
+): Promise<LevelPixels> {
+  const half = size / 2;
+  const data = new Uint8ClampedArray(half * half * 4);
+  const rows = band_rows(size);
+  for (let y = 0; y < size; y += rows) {
+    signal?.throwIfAborted();
+    const height = Math.min(rows, size - y);
+    downscale_2x(read_band(y, height), size, height, data.subarray((y / 2) * half * 4, ((y + height) / 2) * half * 4));
+    await next_task(signal);
+  }
+  return { data, size: half };
+}
+
+// the level below the one the canvas holds. The canvas is read once (the top level); every lower level is made from
+// the one above it in memory, so the canvas's premultiplied storage never adds an error that is carried down
+function downscale_canvas(state: TileGeneratorState, size: number, signal?: AbortSignal): Promise<LevelPixels> {
+  return downscale_level(size, (y, rows) => state.ctx.getImageData(0, y, size, rows).data, signal);
+}
+
+function downscale_pixels(level: LevelPixels, signal?: AbortSignal): Promise<LevelPixels> {
+  const { data, size } = level;
+  return downscale_level(size, (y, rows) => data.subarray(y * size * 4, (y + rows) * size * 4), signal);
+}
+
+// copies the tile at (start_x, start_y) of a level held in memory into the tile canvas
+function put_level_tile(state: TileGeneratorState, level: LevelPixels, start_x: number, start_y: number, tile_size: number) {
+  let image_data = state.tile_image_data;
+  if (!image_data || image_data.width !== tile_size || image_data.height !== tile_size) {
+    image_data = state.tile_ctx.createImageData(tile_size, tile_size);
+    state.tile_image_data = image_data;
+  }
+  const row_bytes = tile_size * 4;
+  for (let row = 0; row < tile_size; row++) {
+    const from = ((start_y + row) * level.size + start_x) * 4;
+    image_data.data.set(level.data.subarray(from, from + row_bytes), row * row_bytes);
+  }
+  // putImageData replaces the pixels (no compositing) and copies them, so the buffer is reused for the next tile
+  state.tile_ctx.putImageData(image_data, 0, 0);
+}
+
 // an encode that has been started but whose bytes are not in the zip yet
 interface PendingTile {
   path: string;
@@ -180,9 +251,11 @@ function start_tile(
     zoom_level: number;
     tile_size: number;
     output_format: OutputFormat;
+    // a level held in memory; the level canvas when left out
+    pixels?: LevelPixels;
   }
 ): PendingTile {
-  const { x, y, zoom_level, tile_size, output_format } = options;
+  const { x, y, zoom_level, tile_size, output_format, pixels } = options;
   const label = `tile ${x},${y} at zoom ${zoom_level}`;
 
   try {
@@ -193,17 +266,21 @@ function start_tile(
     state.tile_canvas.height = tile_size;
     state.tile_ctx.imageSmoothingEnabled = false;
 
-    state.tile_ctx.drawImage(
-      state.canvas,
-      start_x,
-      start_y,
-      tile_size,
-      tile_size,
-      0,
-      0,
-      tile_size,
-      tile_size
-    );
+    if (pixels) {
+      put_level_tile(state, pixels, start_x, start_y, tile_size);
+    } else {
+      state.tile_ctx.drawImage(
+        state.canvas,
+        start_x,
+        start_y,
+        tile_size,
+        tile_size,
+        0,
+        0,
+        tile_size,
+        tile_size
+      );
+    }
 
     const mime_type = MIME_TYPES[output_format];
     if (!mime_type) {
@@ -236,7 +313,7 @@ async function finish_tile(state: TileGeneratorState, tile: PendingTile, signal?
 async function generate_zoom_level(
   state: TileGeneratorState,
   options: {
-    image: HTMLImageElement;
+    source: LevelSource;
     level: TileLevel;
     tile_size: number;
     output_format: OutputFormat;
@@ -245,14 +322,23 @@ async function generate_zoom_level(
     signal?: AbortSignal;
   }
 ): Promise<void> {
-  const { image, level, tile_size, output_format, on_progress, on_tile_progress, signal } = options;
+  const { source, level, tile_size, output_format, on_progress, on_tile_progress, signal } = options;
   const { zoom: zoom_level, tiles_per_side, level_size, scale } = level;
 
   signal?.throwIfAborted();
 
-  // the image sits at the top left of the level's square; under tile size "auto" it fills it exactly
-  setup_canvas(state, level_size, level_size);
-  draw_scaled_image(state, image, image.naturalWidth / scale, image.naturalHeight / scale, scale);
+  let pixels: LevelPixels | undefined;
+  if (source.kind === "image") {
+    // the image sits at the top left of the level's square; under tile size "auto" it fills it exactly
+    const { image } = source;
+    setup_canvas(state, level_size, level_size);
+    draw_scaled_image(state, image, image.naturalWidth / scale, image.naturalHeight / scale, scale);
+  } else {
+    pixels = source.pixels;
+    if (pixels.size !== level_size) {
+      throw new Error(`Zoom ${zoom_level} is ${level_size}px, but its downscaled pixels are ${pixels.size}px`);
+    }
+  }
 
   let processed_count = 0;
   // encodes in flight, oldest first; they are added to the zip in the order they were started
@@ -275,7 +361,7 @@ async function generate_zoom_level(
     for (let y = 0; y < tiles_per_side; y++) {
       signal?.throwIfAborted();
 
-      pending.push(start_tile(state, { x, y, zoom_level, tile_size, output_format }));
+      pending.push(start_tile(state, { x, y, zoom_level, tile_size, output_format, pixels }));
 
       if (pending.length >= MAX_PENDING_ENCODES) {
         await finish_oldest();
@@ -292,6 +378,7 @@ async function generate_zoom_level(
 
 export async function generate_tiles(options: TileGeneratorOptions): Promise<Blob> {
   const { image, plan, output_format, on_progress, on_error, signal } = options;
+  const downscale = options.downscale ?? DEFAULT_DOWNSCALE_MODE;
   const { max_zoom: max_zoom_level, total_tiles } = plan;
 
   signal?.throwIfAborted();
@@ -308,6 +395,8 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
     let processed_tile_count = 0;
     const start_time = Date.now();
     let last_update_time = start_time;
+    // smooth: the level below the one just cut, made from it. Pixel (and the top level): drawn from the image
+    let below: LevelPixels | null = null;
 
     on_progress?.({
       current_zoom_level: max_zoom_level,
@@ -330,8 +419,10 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
         current_stage: "generating"
       });
 
+      const source: LevelSource = below ? { kind: "pixels", pixels: below } : { kind: "image", image };
+
       await generate_zoom_level(state, {
-        image,
+        source,
         level: plan.levels[z],
         tile_size: plan.tile_size,
         output_format,
@@ -383,6 +474,16 @@ export async function generate_tiles(options: TileGeneratorOptions): Promise<Blo
           });
         }
       });
+
+      if (downscale === "smooth" && z > 0) {
+        if (source.kind === "image") {
+          below = await downscale_canvas(state, plan.levels[z].level_size, signal);
+          // the level canvas is not drawn again in this cut; let its memory go
+          setup_canvas(state, 0, 0);
+        } else {
+          below = await downscale_pixels(source.pixels, signal);
+        }
+      }
     }
 
     on_progress?.({

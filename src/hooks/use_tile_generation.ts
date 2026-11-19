@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { MapImage, OutputFormat, TileGenerationProgress } from "@/types/types";
 import { download_zip_file, generate_tiles } from "@/services/tile_generator";
+import { DEFAULT_DOWNSCALE_MODE, DownscaleMode } from "@/services/downscale";
 
 export function useTileGeneration() {
   const [is_generating, set_is_generating] = useState(false);
@@ -14,6 +15,7 @@ export function useTileGeneration() {
     current_stage: "preparing"
   });
   const [output_format, set_output_format] = useState<OutputFormat>("png");
+  const [downscale_mode, set_downscale_mode] = useState<DownscaleMode>(DEFAULT_DOWNSCALE_MODE);
 
   // the running cut's controller; null when no cut runs
   const controller_ref = useRef<AbortController | null>(null);
@@ -47,6 +49,7 @@ export function useTileGeneration() {
         image: image.element,
         plan: image.plan,
         output_format,
+        downscale: downscale_mode,
         file_name: image.file_name,
         signal,
         // an aborted cut no longer writes to the panel
@@ -74,7 +77,7 @@ export function useTileGeneration() {
         setTimeout(reset_state, 2000);
       }
     }
-  }, [output_format, reset_state]);
+  }, [output_format, downscale_mode, reset_state]);
 
   const cancel_generation = useCallback(() => {
     controller_ref.current?.abort();
@@ -89,6 +92,8 @@ export function useTileGeneration() {
     progress,
     output_format,
     set_output_format,
+    downscale_mode,
+    set_downscale_mode,
     generate_tiles: generate_tiles_handler,
     cancel_generation,
     reset_error: () => set_error(null)

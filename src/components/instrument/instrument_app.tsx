@@ -27,6 +27,50 @@ function RailSection({ index, title, delay, children }: {
   );
 }
 
+// a row of mutually exclusive choices, the selected one lit
+function ChoiceGroup<T extends string>({ label, options, value, on_change, disabled, hint }: {
+  label: string;
+  options: readonly { value: T; label: string }[];
+  value: T;
+  on_change: (value: T) => void;
+  disabled: boolean;
+  hint: string;
+}) {
+  return (
+    <div role="group" aria-label={label}>
+      <div className="mb-1.5 text-[11px] tracking-[0.18em] text-[var(--c-dim)]">{label}</div>
+      <div className="grid grid-cols-2 gap-1.5">
+        {options.map((option) => (
+          <button
+            key={option.value}
+            onClick={() => on_change(option.value)}
+            disabled={disabled}
+            aria-pressed={value === option.value}
+            className={`border py-2 text-[12px] font-semibold tracking-[0.18em] transition-colors disabled:opacity-40 ${
+              value === option.value
+                ? "border-[var(--c-acc)] bg-[#3dffa0]/10 text-[var(--c-acc)]"
+                : "border-[var(--c-line)] text-[var(--c-dim)] hover:border-[var(--c-dim)] hover:text-[var(--c-text)]"
+            }`}
+          >
+            {option.label}
+          </button>
+        ))}
+      </div>
+      <div className="mt-2 text-[12px] text-[var(--c-dim)]">{hint}</div>
+    </div>
+  );
+}
+
+const FORMAT_OPTIONS = [
+  { value: "png", label: "PNG" },
+  { value: "webp", label: "WEBP" }
+] as const;
+
+const DOWNSCALE_OPTIONS = [
+  { value: "pixel", label: "PIXEL" },
+  { value: "smooth", label: "SMOOTH" }
+] as const;
+
 function DataRow({ label, children }: {
   label: string;
   children: React.ReactNode;
@@ -54,6 +98,8 @@ export function InstrumentApp() {
     progress,
     output_format,
     set_output_format,
+    downscale_mode,
+    set_downscale_mode,
     generate_tiles,
     cancel_generation,
     reset_error
@@ -236,24 +282,27 @@ export function InstrumentApp() {
           </RailSection>
 
           <RailSection index="03" title="OUTPUT" delay={240}>
-            <div className="grid grid-cols-2 gap-1.5">
-              {(["png", "webp"] as const).map((format) => (
-                <button
-                  key={format}
-                  onClick={() => set_output_format(format)}
-                  disabled={is_generating}
-                  className={`border py-2 text-[12px] font-semibold tracking-[0.18em] transition-colors disabled:opacity-40 ${
-                    output_format === format
-                      ? "border-[var(--c-acc)] bg-[#3dffa0]/10 text-[var(--c-acc)]"
-                      : "border-[var(--c-line)] text-[var(--c-dim)] hover:border-[var(--c-dim)] hover:text-[var(--c-text)]"
-                  }`}
-                >
-                  {format.toUpperCase()}
-                </button>
-              ))}
-            </div>
-            <div className="mt-2 text-[12px] text-[var(--c-dim)]">
-              {output_format === "png" ? "Lossless — larger archive" : "Compressed — smaller archive"}
+            <div className="space-y-4">
+              <ChoiceGroup
+                label="FORMAT"
+                options={FORMAT_OPTIONS}
+                value={output_format}
+                on_change={set_output_format}
+                disabled={is_generating}
+                hint={output_format === "png" ? "Lossless — larger archive" : "Compressed — smaller archive"}
+              />
+              <ChoiceGroup
+                label="DOWNSCALE"
+                options={DOWNSCALE_OPTIONS}
+                value={downscale_mode}
+                on_change={set_downscale_mode}
+                disabled={is_generating}
+                hint={
+                  downscale_mode === "pixel"
+                    ? "Nearest pixel — keeps pixel art sharp"
+                    : "2×2 average — for painted and 3D maps"
+                }
+              />
             </div>
           </RailSection>
 
