@@ -1,0 +1,13 @@
+# Dependabot version updates. Security alerts and security update PRs are switched on separately, in the repository's
+# Settings > Code security ("Dependabot alerts", "Dependabot security updates").
+version: 2
+updates:
+  - package-ecosystem: "npm" # also covers pnpm (pnpm-lock.yaml)
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for all minor and patch bumps; majors (e.g. next 17) come one PR each.
+      minor-and-patch:
+        update-types: ["minor", "patch"]
